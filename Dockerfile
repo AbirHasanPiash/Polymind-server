@@ -1,35 +1,48 @@
-# Use Python 3.11 slim for efficiency
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1
 
-# Set environment variables
+# ---- build stage: compile wheels, keep the toolchain out of the final image ----
+FROM python:3.11-slim AS builder
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-WORKDIR /app
-
-# Install system dependencies
-# We include curl/netcat for healthchecks if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libpq-dev \
-    curl \
+        gcc \
+        libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install -r requirements.txt
 
-# SECURITY: Create a non-root user
-# We create a user named 'appuser' with UID 1000
-RUN useradd -m -u 1000 appuser
+# ---- runtime stage ----
+FROM python:3.11-slim
 
-# Copy application code
-COPY . .
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
 
-# Change ownership of the app directory to the non-root user
-RUN chown -R appuser:appuser /app
+# curl is kept for the container healthcheck below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        libpq5 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 appuser
 
-# Switch to non-root user
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+COPY --chown=appuser:appuser . .
+
 USER appuser
 
-# We do not set a default CMD, as we use this image for both Web and Worker
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health/live || exit 1
+
+# The same image runs both roles; docker-compose supplies the command.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

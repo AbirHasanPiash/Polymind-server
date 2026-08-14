@@ -1,29 +1,64 @@
-version: '3.8'
-
 services:
   web:
-    build: .  # Local builds from source, Prod pulls from GHCR
+    build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      - .:/app # Hot reloading enabled
-      - ./google_credentials.json:/app/google_credentials.json
+      - .:/app
+      - ./google_credentials.json:/app/google_credentials.json:ro
     env_file: .env
     ports:
       - "8000:8000"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   worker:
     build: .
-    command: celery -A app.main.celery_app worker --loglevel=info
+    # The Celery app lives in app.workers.celery_app and pulls in app.workers.tasks.
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
     volumes:
-      - .:/app # Hot reloading for worker (requires watchdog, or manual restart)
-      - ./google_credentials.json:/app/google_credentials.json
+      - .:/app
+      - ./google_credentials.json:/app/google_credentials.json:ro
     env_file: .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   redis:
-    image: redis:alpine
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --loglevel warning
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional local database: `docker compose --profile local-db up`.
+  # Point DATABASE_URL at postgresql+asyncpg://postgres:postgres@postgres:5432/ai_platform
+  postgres:
+    profiles: ["local-db"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis_data:
+  postgres_data:

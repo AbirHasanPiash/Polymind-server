@@ -1,45 +1,50 @@
-from abc import ABC, abstractmethod
-from typing import AsyncGenerator, Union, List, Dict, Any
-from app.services.llm.usage import Usage
-from app.services.llm.schema import ChatMessage
+"""Contract every LLM adapter implements."""
 
-PromptType = Union[str, List[ChatMessage], List[Dict[str, str]]]
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
+from decimal import Decimal
+
+from app.services.llm.models import ModelSpec, get_spec, price_in_credits
+from app.services.llm.schema import ChatMessage
+from app.services.llm.usage import Usage
+
+PromptType = str | list[ChatMessage] | list[dict[str, str]]
+
+# Cap on a single completion, guarding against a runaway (and expensive) response.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+
+class ProviderNotConfiguredError(RuntimeError):
+    """Raised when a provider is selected but its API key is not configured."""
+
+    def __init__(self, provider: str, env_var: str) -> None:
+        super().__init__(f"{provider} is not configured. Set {env_var} to enable it.")
+        self.provider = provider
+        self.env_var = env_var
+
 
 class LLMProvider(ABC):
-    """
-    Abstract Base Class that defines the contract for all AI Adapters.
-    Ensures OpenAI, Gemini, and Claude adapters all behave identically.
-    """
+    """Uniform interface over OpenAI, Anthropic and Gemini."""
 
     @abstractmethod
-    async def generate_stream(
-        self,
-        prompt: PromptType,
-        model: str,
-        usage: Usage
+    def generate_stream(
+        self, prompt: PromptType, model: str, usage: Usage
     ) -> AsyncGenerator[str, None]:
-        """
-        Yields text chunks for real-time streaming.
-        Must update the `usage` object in-place.
-        """
-        pass
+        """Yield text chunks as they arrive, updating ``usage`` in place."""
 
     @abstractmethod
-    async def generate_text(
-        self,
-        prompt: PromptType,
-        model: str,
-        usage: Usage
-    ) -> str:
-        """
-        Returns the full response as a single string (non-streaming).
-        """
-        pass
+    async def generate_text(self, prompt: PromptType, model: str, usage: Usage) -> str:
+        """Return the whole completion at once, updating ``usage`` in place."""
 
-    @abstractmethod
-    def calculate_cost(self, usage: Usage, model: str) -> float:
+    @staticmethod
+    def spec(model: str) -> ModelSpec:
+        return get_spec(model)
+
+    def calculate_cost(self, usage: Usage, model: str) -> Decimal:
+        """Price the call in wallet credits.
+
+        Shared by all providers so pricing can never diverge per adapter.
         """
-        Calculates the cost based on token usage.
-        Returns the cost as a float representing micro-cents.
-        """
-        pass
+        return price_in_credits(usage, model)

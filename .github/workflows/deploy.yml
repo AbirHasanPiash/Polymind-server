@@ -1,68 +1,98 @@
-name: Deploy to AWS
+name: CI / Deploy
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
 env:
-  # Docker requires lowercase image names
   REGISTRY: ghcr.io
   IMAGE_NAME: abirhasanpiash/multimodal-ai-platform
 
 jobs:
+  # Lint and test gate: nothing is built or deployed unless this passes.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check app tests alembic
+
+      - name: Test
+        run: pytest -q
+        env:
+          # The suite needs no live services; these satisfy settings validation.
+          SECRET_KEY: ci-secret-key-that-is-long-enough-for-validation
+          DATABASE_URL: postgresql+asyncpg://ci:ci@localhost:5432/ci
+          REDIS_URL: redis://localhost:6379/15
+
   build-and-push:
+    needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Log in to the Container registry
+      - name: Log in to the container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: type=raw,value=latest
+          # Tag with the commit SHA as well as latest, so a bad deploy can be
+          # rolled back to a specific image instead of a moving tag.
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
 
-      - name: Build and push Docker image
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Deploy to EC2
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Login to GitHub Container Registry
+            set -euo pipefail
+
             echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            
-            # Pull the latest image
             docker pull ghcr.io/abirhasanpiash/multimodal-ai-platform:latest
-            
-            # Generate the Production docker-compose.yml
-            cat <<EOF > docker-compose.yml
-            version: '3.8'
+
+            cat <<'EOF' > docker-compose.yml
             services:
               web:
                 image: ghcr.io/abirhasanpiash/multimodal-ai-platform:latest
@@ -70,34 +100,58 @@ jobs:
                 restart: always
                 command: uvicorn app.main:app --host 0.0.0.0 --port 8000
                 volumes:
-                  - /home/ubuntu/secrets/google_credentials.json:/app/google_credentials.json
+                  - /home/ubuntu/secrets/google_credentials.json:/app/google_credentials.json:ro
                 env_file: .env
                 ports:
                   - "8000:8000"
                 depends_on:
-                  - redis
+                  redis:
+                    condition: service_healthy
 
               worker:
                 image: ghcr.io/abirhasanpiash/multimodal-ai-platform:latest
                 container_name: fastapi_worker
                 restart: always
-                command: celery -A app.workers.tasks worker --loglevel=info
+                command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
                 volumes:
-                  - /home/ubuntu/secrets/google_credentials.json:/app/google_credentials.json
+                  - /home/ubuntu/secrets/google_credentials.json:/app/google_credentials.json:ro
                 env_file: .env
                 depends_on:
-                  - redis
+                  redis:
+                    condition: service_healthy
 
               redis:
-                image: redis:alpine
+                image: redis:7-alpine
                 container_name: fastapi_redis
                 restart: always
-                ports:
-                  - "6379:6379"
-            EOF
-            
-            # Restart Services (Zero Downtime attempt)
-            docker-compose up -d --remove-orphans
+                command: redis-server --save 60 1 --loglevel warning
+                volumes:
+                  - redis_data:/data
+                healthcheck:
+                  test: ["CMD", "redis-cli", "ping"]
+                  interval: 10s
+                  timeout: 3s
+                  retries: 5
 
-            # Clean up old images to save disk space
-            docker system prune -f
+            volumes:
+              redis_data:
+            EOF
+
+            # Apply any pending migrations before the new code starts serving.
+            docker compose run --rm web alembic upgrade head
+
+            docker compose up -d --remove-orphans
+
+            # Fail the deploy if the new container never becomes healthy.
+            for attempt in $(seq 1 20); do
+              if curl -fsS http://localhost:8000/health > /dev/null; then
+                echo "Health check passed"
+                docker system prune -f
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "Health check failed after deploy"
+            docker compose logs --tail=100 web
+            exit 1

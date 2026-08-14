@@ -1,0 +1,39 @@
+[project]
+name = "ai-platform-backend"
+version = "1.0.0"
+description = "Multi-provider AI platform backend: streaming chat, media generation, wallet billing"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["venv", ".venv", "alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "ASYNC",
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+    "B008",  # FastAPI dependencies are function calls in defaults by design
+]
+
+[tool.ruff.lint.per-file-ignores]
+"app/models/*.py" = ["F401"]   # models are imported for their side effects
+"tests/*" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/workers/*", "alembic/*"]

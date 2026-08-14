@@ -1,62 +1,111 @@
-import redis.asyncio as redis
+"""Shared Redis connection pool and the chat cache built on top of it."""
+
+from __future__ import annotations
+
 import json
-from typing import List
+import logging
+from collections.abc import AsyncGenerator
+
+import redis.asyncio as redis
+
 from app.core.config import settings
-from app.services.llm.schema import ChatMessage 
+from app.services.llm.schema import ChatMessage
 
-REDIS_URL = settings.REDIS_URL
+logger = logging.getLogger(__name__)
 
-async def get_redis():
-    """Dependency to get Redis connection"""
-    client = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+# One pool per process: creating a client per request opens (and TLS-handshakes)
+# a fresh socket every time, which dominates latency on small requests.
+_pool = redis.ConnectionPool.from_url(
+    settings.REDIS_URL,
+    encoding="utf-8",
+    decode_responses=True,
+    max_connections=settings.REDIS_MAX_CONNECTIONS,
+    health_check_interval=30,
+)
+
+_client = redis.Redis(connection_pool=_pool)
+
+
+def get_redis_client() -> redis.Redis:
+    """Return the process-wide Redis client."""
+    return _client
+
+
+async def get_redis() -> AsyncGenerator[redis.Redis, None]:
+    """FastAPI dependency. Connections return to the pool, they are not closed."""
+    yield _client
+
+
+async def check_redis_connection() -> bool:
     try:
-        yield client
-    finally:
-        await client.aclose()
+        await _client.ping()
+        return True
+    except Exception as exc:
+        logger.warning("Redis health check failed: %s", exc)
+        return False
+
+
+async def close_redis() -> None:
+    """Release pooled connections on shutdown."""
+    await _client.aclose()
+    await _pool.aclose()
+
 
 class ChatCache:
-    """Helper to manage Chat History in Redis"""
-    def __init__(self, redis_client: redis.Redis):
+    """Short-lived chat history and upload staging area.
+
+    Every key carries a TTL, so an abandoned conversation cannot pin memory in
+    Redis forever. PostgreSQL remains the source of truth for history.
+    """
+
+    def __init__(self, redis_client: redis.Redis, ttl: int | None = None) -> None:
         self.redis = redis_client
-        self.ttl = 3600  # Cache expires in 1 hour
+        self.ttl = ttl or settings.CACHE_TTL_SECONDS
 
-    async def add_message(self, chat_id: str, role: str, content: str):
-        key = f"chat:{chat_id}:history"
-        # We serialize to JSON for storage
-        msg = json.dumps({"role": role, "content": content})
-        await self.redis.rpush(key, msg)
-        await self.redis.expire(key, self.ttl)
+    @staticmethod
+    def _history_key(chat_id: str) -> str:
+        return f"chat:{chat_id}:history"
 
-    async def get_history(self, chat_id: str, limit: int = 10) -> List[ChatMessage]:
-        key = f"chat:{chat_id}:history"
-        raw_messages = await self.redis.lrange(key, -limit, -1)
-        
-        # Transformation Logic: JSON String -> Dict -> ChatMessage Object
-        history_objects = []
-        for m in raw_messages:
-            data = json.loads(m)
-            obj = ChatMessage.from_text(role=data["role"], content=data["content"])
-            history_objects.append(obj)
-            
-        return history_objects
-    
-    async def save_temp_file(self, file_id: str, file_data: dict):
-        """
-        Stores file content (base64 or text) in Redis with an expiration.
-        """
-        key = f"temp_file:{file_id}"
-        await self.redis.setex(
-            key,
-            self.ttl,
-            json.dumps(file_data)
-        )
+    @staticmethod
+    def _file_key(file_id: str) -> str:
+        return f"temp_file:{file_id}"
+
+    async def add_message(self, chat_id: str, role: str, content: str) -> None:
+        key = self._history_key(chat_id)
+        payload = json.dumps({"role": role, "content": content})
+        # Pipeline: one round-trip instead of two.
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.rpush(key, payload)
+            pipe.ltrim(key, -settings.CHAT_HISTORY_LIMIT * 2, -1)
+            pipe.expire(key, self.ttl)
+            await pipe.execute()
+
+    async def get_history(self, chat_id: str, limit: int | None = None) -> list[ChatMessage]:
+        limit = limit or settings.CHAT_HISTORY_LIMIT
+        raw_messages = await self.redis.lrange(self._history_key(chat_id), -limit, -1)
+
+        history: list[ChatMessage] = []
+        for raw in raw_messages:
+            try:
+                data = json.loads(raw)
+                history.append(ChatMessage.from_text(role=data["role"], text=data["content"]))
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                logger.warning("Discarding malformed cached message for chat %s: %s", chat_id, exc)
+        return history
+
+    async def clear_history(self, chat_id: str) -> None:
+        await self.redis.delete(self._history_key(chat_id))
+
+    async def save_temp_file(self, file_id: str, file_data: dict) -> None:
+        """Stage extracted file content (text or base64) until it is sent in a message."""
+        await self.redis.setex(self._file_key(file_id), self.ttl, json.dumps(file_data))
 
     async def get_temp_file(self, file_id: str) -> dict | None:
-        """
-        Retrieves file content by ID.
-        """
-        key = f"temp_file:{file_id}"
-        data = await self.redis.get(key)
-        if data:
+        data = await self.redis.get(self._file_key(file_id))
+        if not data:
+            return None
+        try:
             return json.loads(data)
-        return None
+        except json.JSONDecodeError:
+            logger.warning("Discarding malformed staged file %s", file_id)
+            return None

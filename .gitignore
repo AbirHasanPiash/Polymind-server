@@ -94,3 +94,6 @@ secrets/
 credentials/
 
 google_credentials.json
+# Tooling caches
+.ruff_cache/
+.mypy_cache/

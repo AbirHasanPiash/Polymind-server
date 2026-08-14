@@ -1,12 +1,18 @@
-from dataclasses import dataclass
-import math
+"""Token accounting shared by every LLM adapter."""
 
-@dataclass
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+# Rough industry average for English text; only used when a provider omits usage.
+CHARS_PER_TOKEN = 4
+
+
+@dataclass(slots=True)
 class Usage:
-    """
-    Mutable container for token usage statistics.
-    passed by reference to LLM Providers.
-    """
+    """Mutable token counter passed by reference into the adapters."""
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
@@ -14,15 +20,25 @@ class Usage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def ensure_validity(self, prompt_text: str, completion_text: str):
+    def record(self, prompt_tokens: int | None = None, completion_tokens: int | None = None) -> None:
+        """Store counts reported by a provider, ignoring the Nones some SDKs send.
+
+        Streaming APIs report usage in a late chunk and may send ``None`` in the
+        earlier ones; assigning those directly would break the arithmetic that
+        billing depends on.
         """
-        Fallback mechanism:
-        If the API failed to report tokens (count is 0), 
-        estimate them based on character count (approx 4 chars per token).
-        This prevents billing leaks.
+        if prompt_tokens is not None:
+            self.prompt_tokens = int(prompt_tokens)
+        if completion_tokens is not None:
+            self.completion_tokens = int(completion_tokens)
+
+    def ensure_validity(self, prompt_text: str, completion_text: str) -> None:
+        """Fall back to a character-based estimate when the provider reported none.
+
+        Without this a failed usage report would bill the user zero, so the
+        estimate is deliberately charged rather than skipped.
         """
-        if self.prompt_tokens == 0 and prompt_text:
-            self.prompt_tokens = math.ceil(len(prompt_text) / 4)
-            
-        if self.completion_tokens == 0 and completion_text:
-            self.completion_tokens = math.ceil(len(completion_text) / 4)
+        if self.prompt_tokens <= 0 and prompt_text:
+            self.prompt_tokens = math.ceil(len(prompt_text) / CHARS_PER_TOKEN)
+        if self.completion_tokens <= 0 and completion_text:
+            self.completion_tokens = math.ceil(len(completion_text) / CHARS_PER_TOKEN)

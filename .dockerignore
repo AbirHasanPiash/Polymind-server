@@ -1,7 +1,44 @@
+# Version control
 .git
+.github
+.gitignore
+
+# Secrets
 .env
-__pycache__
-venv/
-*.pyc
-.DS_Store
+.env.*
+!.env.example
 google_credentials.json
+secrets/
+credentials/
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Tooling & tests
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+tests/
+
+# Editors & OS
+.vscode/
+.idea/
+.DS_Store
+
+# Docs & local artefacts
+README.md
+docker-compose.yml
+*.log
+*.sqlite3
+*.db
+dump.rdb

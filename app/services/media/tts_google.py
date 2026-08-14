@@ -1,98 +1,98 @@
-import os
-os.environ["GRPC_DNS_RESOLVER"] = "native"
-import uuid
+"""Google Cloud Text-to-Speech."""
+
+from __future__ import annotations
+
+import asyncio
 import logging
+import os
+import re
+import uuid
 from decimal import Decimal
+from functools import cached_property
+
 from google.cloud import texttospeech
 from google.oauth2 import service_account
+
 from app.core.config import settings
+from app.services.llm.models import CREDIT_PRECISION, PROFIT_MARGIN, USD_TO_CREDITS_RATE
 from app.services.storage import storage
 
 logger = logging.getLogger(__name__)
 
+# Google TTS voice names look like "en-US-Neural2-F"; the first two segments are
+# the BCP-47 language code the API expects alongside the voice.
+_VOICE_PATTERN = re.compile(r"^[a-z]{2}-[A-Z]{2}-[A-Za-z0-9]+(-[A-Za-z0-9]+)*$")
+
+DEFAULT_VOICE = "en-US-Neural2-F"
+MAX_TTS_CHARS = 4096  # Google's per-request limit for a single synthesis
+
+
+class InvalidVoiceError(ValueError):
+    def __init__(self, voice_name: str) -> None:
+        super().__init__(f"Invalid voice name: {voice_name!r}")
+        self.voice_name = voice_name
+
+
 class GoogleTTSService:
     PROVIDER_COST_PER_CHAR = Decimal("0.000016")
 
-    PROFIT_MARGIN = Decimal("4.0")
-    USD_TO_CREDITS_RATE = Decimal("10.0")
+    @cached_property
+    def client(self) -> texttospeech.TextToSpeechClient:
+        """Created on first use so a missing key file cannot break startup."""
+        path = settings.GOOGLE_APPLICATION_CREDENTIALS
+        if path and os.path.exists(path):
+            credentials = service_account.Credentials.from_service_account_file(path)
+            return texttospeech.TextToSpeechClient(credentials=credentials)
 
-    def __init__(self):
-        # Authenticate using the JSON key file path from env
-        self.credentials_path = settings.GOOGLE_APPLICATION_CREDENTIALS
-        
-        
-        # Check if path is set and file exists
-        if self.credentials_path and os.path.exists(self.credentials_path):
-            self.credentials = service_account.Credentials.from_service_account_file(
-                self.credentials_path
-            )
-            self.client = texttospeech.TextToSpeechClient(credentials=self.credentials)
-        else:
-            # Helpful error message if file is missing
-            if self.credentials_path:
-                logger.error(f"Credentials file not found at: {self.credentials_path}")
-            else:
-                logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set in .env")
-                
-            self.client = texttospeech.TextToSpeechClient()
+        if path:
+            logger.warning("GOOGLE_APPLICATION_CREDENTIALS points to a missing file: %s", path)
+        # Falls back to Application Default Credentials (workload identity, gcloud…).
+        return texttospeech.TextToSpeechClient()
 
     def calculate_cost(self, text: str) -> Decimal:
-        """
-        Calculates the final cost in CREDITS for the user.
-        Formula: (Chars * ProviderPrice * Margin) * ExchangeRate
-        """
-        char_count = len(text)
-        cost_usd = Decimal(char_count) * self.PROVIDER_COST_PER_CHAR
-        price_to_user_usd = cost_usd * self.PROFIT_MARGIN
-        total_credits = price_to_user_usd * self.USD_TO_CREDITS_RATE
-        
-        # Round to 6 decimal places
-        return total_credits.quantize(Decimal("0.000001"))
+        """Price in wallet credits: (chars x provider rate x margin) x credit rate."""
+        provider_cost = Decimal(len(text)) * self.PROVIDER_COST_PER_CHAR
+        return (provider_cost * PROFIT_MARGIN * USD_TO_CREDITS_RATE).quantize(CREDIT_PRECISION)
 
-    async def generate_audio(self, text: str, voice_name: str = "en-US-Neural2-F") -> str:
-        """
-        Generates MP3 audio from text, uploads to Storage, and returns public URL.
-        """
-        try:
-            # Configure the request
-            synthesis_input = texttospeech.SynthesisInput(text=text)
+    @staticmethod
+    def validate_voice(voice_name: str) -> str:
+        """Reject malformed voice ids before they reach the API."""
+        if not voice_name or not _VOICE_PATTERN.match(voice_name):
+            raise InvalidVoiceError(voice_name)
+        return voice_name
 
-            # Build the voice request
-            voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US",
-                name=voice_name
-            )
+    @staticmethod
+    def _language_code(voice_name: str) -> str:
+        return "-".join(voice_name.split("-")[:2])
 
-            # Select the type of audio file you want returned
-            audio_config = texttospeech.AudioConfig(
+    def _synthesize(self, text: str, voice_name: str) -> bytes:
+        response = self.client.synthesize_speech(
+            input=texttospeech.SynthesisInput(text=text),
+            voice=texttospeech.VoiceSelectionParams(
+                language_code=self._language_code(voice_name),
+                name=voice_name,
+            ),
+            audio_config=texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.MP3,
                 speaking_rate=1.0,
-                pitch=0.0
-            )
+                pitch=0.0,
+            ),
+        )
+        return response.audio_content
 
-            # Call Google API
-            response = self.client.synthesize_speech(
-                input=synthesis_input, 
-                voice=voice, 
-                audio_config=audio_config
-            )
+    async def generate_audio(self, text: str, voice_name: str = DEFAULT_VOICE) -> str:
+        """Synthesize MP3 audio, store it, and return its public URL."""
+        self.validate_voice(voice_name)
+        text = text[:MAX_TTS_CHARS]
 
-            # Upload to R2 Storage
-            # Generate a unique filename
-            filename = f"tts/{uuid.uuid4()}.mp3"
-            
-            # The response.audio_content is bytes
-            public_url = storage.upload_file(
-                file_bytes=response.audio_content,
-                destination_path=filename,
-                content_type="audio/mpeg"
-            )
-            
-            return public_url
+        # The Google client is synchronous; keep it off the event loop.
+        audio_bytes = await asyncio.to_thread(self._synthesize, text, voice_name)
 
-        except Exception as e:
-            logger.error(f"Google TTS generation failed: {e}")
-            raise e
+        return await storage.upload_file_async(
+            file_bytes=audio_bytes,
+            destination_path=f"tts/{uuid.uuid4()}.mp3",
+            content_type="audio/mpeg",
+        )
 
-# Singleton instance
+
 tts_service = GoogleTTSService()

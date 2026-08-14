@@ -1,256 +1,207 @@
-from fastapi import APIRouter, HTTPException, status
-from sqlalchemy.future import select
-from sqlalchemy.exc import OperationalError, InterfaceError
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
-import secrets
+"""Signup, login and Google OAuth."""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+import secrets
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
-from app.core.database import async_session_maker
-from app.models.user import User, Wallet
-from app.schemas.user import UserCreate, Token, UserLogin, GoogleLogin
-from app.core.security import get_password_hash, verify_password, create_access_token
+from fastapi import APIRouter, HTTPException, status
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
+
 from app.core.config import settings
+from app.core.database import async_session_maker
+from app.core.security import create_access_token, get_password_hash, verify_password
+from app.models.user import SIGNUP_BONUS_CREDITS, User, Wallet
+from app.schemas.user import GoogleLogin, Token, UserCreate, UserLogin
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+T = TypeVar("T")
 
-async def execute_with_retry(
-    operation,
-    max_retries: int = 3,
-    base_delay: float = 1.0
-):
-    """
-    Execute a database operation with automatic retry on connection failures.
-    Uses exponential backoff between retries.
-    """
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return await operation()
-        except (
-            OperationalError,
-            InterfaceError,
-            TimeoutError,
-            asyncio.CancelledError,
-            ConnectionRefusedError,
-            OSError
-        ) as e:
-            last_exception = e
-            if attempt < max_retries - 1:
-                wait_time = base_delay * (2 ** attempt)
-                logger.warning(
-                    f"Database operation failed (attempt {attempt + 1}/{max_retries}), "
-                    f"retrying in {wait_time}s: {type(e).__name__}: {str(e)}"
-                )
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(
-                    f"Database operation failed after {max_retries} attempts: "
-                    f"{type(e).__name__}: {str(e)}"
-                )
-    
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Database temporarily unavailable. Please try again in a few moments."
+# Managed Postgres services drop idle connections; the auth path is the one place
+# where a transient reconnect should not surface as a failed login.
+RETRYABLE_ERRORS = (OperationalError, InterfaceError, ConnectionRefusedError, TimeoutError)
+
+INVALID_CREDENTIALS = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST,
+    detail="Incorrect email or password",
+)
+
+
+def _token_response(subject: str) -> Token:
+    return Token(
+        access_token=create_access_token(subject),
+        token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
 
+async def execute_with_retry(
+    operation: Callable[[], Awaitable[T]],
+    max_retries: int = 3,
+    base_delay: float = 0.5,
+) -> T:
+    """Run a database operation, retrying transient connection failures.
+
+    Only connection-level errors are retried — a failed operation with a real
+    error (integrity, programming) is raised immediately. ``CancelledError`` is
+    never caught: swallowing it would keep work running after a client hangs up.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await operation()
+        except RETRYABLE_ERRORS as exc:
+            if attempt == max_retries:
+                logger.error("Database unavailable after %s attempts: %s", max_retries, exc)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Database temporarily unavailable. Please try again shortly.",
+                ) from exc
+            delay = base_delay * 2 ** (attempt - 1)
+            logger.warning(
+                "Database attempt %s/%s failed (%s), retrying in %ss",
+                attempt, max_retries, type(exc).__name__, delay,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 async def get_user_by_email(email: str) -> User | None:
-    """Get user by email with retry logic."""
-    async def operation():
+    async def operation() -> User | None:
         async with async_session_maker() as db:
             result = await db.execute(select(User).where(User.email == email))
             return result.scalar_one_or_none()
-    
+
     return await execute_with_retry(operation)
 
 
 async def create_user_with_wallet(
     email: str,
-    hashed_password: str,
+    hashed_password: str | None,
     full_name: str,
-    is_active: bool = True
 ) -> User:
-    """Create a new user with wallet using retry logic."""
-    async def operation():
+    """Create the user and their wallet in a single transaction.
+
+    Both rows commit together, so a user can never exist without a wallet. A
+    concurrent signup with the same email loses the unique-index race and is
+    reported as a duplicate rather than a 500.
+    """
+
+    async def operation() -> User:
         async with async_session_maker() as db:
-            # Create User
-            new_user = User(
+            user = User(
                 email=email,
                 hashed_password=hashed_password,
                 full_name=full_name,
-                is_active=is_active
+                is_active=True,
             )
-            db.add(new_user)
-            await db.commit()
-            await db.refresh(new_user)
-            
-            # Create Wallet
-            wallet = Wallet(user_id=new_user.id, credits=10.0)
-            db.add(wallet)
-            await db.commit()
-            
-            return new_user
-    
+            user.wallet = Wallet(credits=SIGNUP_BONUS_CREDITS)
+            db.add(user)
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already registered",
+                ) from None
+            await db.refresh(user)
+            return user
+
     return await execute_with_retry(operation)
 
 
-# Auth Endpoints
-
+# Note: 201 would be the more correct status for a create, but existing clients
+# check for 200, so the status is kept as-is.
 @router.post("/signup", response_model=Token)
-async def signup(user_in: UserCreate):
-    """
-    Register a new user with email and password.
-    """
-    try:
-        # Check if user exists
-        existing_user = await get_user_by_email(user_in.email)
-        if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-
-        # Create User with Wallet
-        new_user = await create_user_with_wallet(
-            email=user_in.email,
-            hashed_password=get_password_hash(user_in.password),
-            full_name="New User",
-            is_active=True
-        )
-
-        # Return Token
-        access_token = create_access_token(data={"sub": new_user.email})
-        return {"access_token": access_token, "token_type": "bearer"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Unexpected error during signup: {str(e)}")
+async def signup(user_in: UserCreate) -> Token:
+    """Register with email and password."""
+    if await get_user_by_email(user_in.email):
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during signup"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered",
         )
+
+    user = await create_user_with_wallet(
+        email=user_in.email,
+        hashed_password=get_password_hash(user_in.password),
+        full_name=user_in.full_name or "New User",
+    )
+    logger.info("New user registered: %s", user.email)
+    return _token_response(user.email)
 
 
 @router.post("/login", response_model=Token)
-async def login(user_in: UserLogin):
-    """
-    Login with email and password.
-    """
-    try:
-        # Get user from database
-        user = await get_user_by_email(user_in.email)
-        
-        # Verify credentials
-        if not user or not verify_password(user_in.password, user.hashed_password):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Incorrect email or password"
-            )
-        
-        # Return Token
-        access_token = create_access_token(data={"sub": user.email})
-        return {"access_token": access_token, "token_type": "bearer"}
+async def login(user_in: UserLogin) -> Token:
+    """Exchange email and password for an access token."""
+    user = await get_user_by_email(user_in.email)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Unexpected error during login: {str(e)}")
+    # Same error for unknown email and wrong password: revealing which one is
+    # wrong turns the endpoint into an account-enumeration oracle.
+    if not user or not verify_password(user_in.password, user.hashed_password):
+        raise INVALID_CREDENTIALS
+
+    if not user.is_active:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during login"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account has been deactivated",
         )
+
+    return _token_response(user.email)
 
 
 @router.post("/google", response_model=Token)
-async def google_login(login_data: GoogleLogin):
-    """
-    Login or register using Google OAuth2.
-    """
-    try:
-        # Verify the Token with Google
-        try:
-            id_info = id_token.verify_oauth2_token(
-                login_data.token,
-                google_requests.Request(),
-                settings.GOOGLE_CLIENT_ID
-            )
-        except ValueError as e:
-            logger.warning(f"Invalid Google token: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Google Token"
-            )
-
-        # Extract User Info
-        email = id_info.get("email")
-        name = id_info.get("name", "Google User")
-        
-        if not email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Google Token: Email missing"
-            )
-
-        # Check if User Exists in DB
-        user = await get_user_by_email(email)
-
-        if not user:
-            # Auto-Register New User
-            logger.info(f"Creating new user from Google login: {email}")
-            random_password = secrets.token_urlsafe(32)
-            hashed_pw = get_password_hash(random_password)
-            
-            user = await create_user_with_wallet(
-                email=email,
-                hashed_password=hashed_pw,
-                full_name=name,
-                is_active=True
-            )
-
-        # Create Access Token
-        access_token = create_access_token(data={"sub": user.email})
-        return {"access_token": access_token, "token_type": "bearer"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Unexpected error during Google login: {str(e)}")
+async def google_login(login_data: GoogleLogin) -> Token:
+    """Log in (or register) with a Google ID token."""
+    if not settings.google_login_enabled:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during authentication"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google login is not configured",
         )
 
-
-# Health Check Endpoint
-
-@router.get("/health")
-async def health_check():
-    """
-    Check if the auth service and database are healthy.
-    """
     try:
-        # Try to connect to database
-        async def check_db():
-            async with async_session_maker() as db:
-                await db.execute(select(1))
-                return True
-        
-        db_healthy = await execute_with_retry(check_db, max_retries=1, base_delay=0.5)
-        
-        return {
-            "status": "healthy",
-            "database": "connected" if db_healthy else "disconnected"
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {
-            "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e)
-        }
+        id_info = await asyncio.to_thread(
+            id_token.verify_oauth2_token,
+            login_data.token,
+            google_requests.Request(),
+            settings.GOOGLE_CLIENT_ID,
+        )
+    except ValueError as exc:
+        logger.warning("Rejected Google token: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Google token",
+        ) from None
+
+    email = id_info.get("email")
+    if not email or not id_info.get("email_verified", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google account has no verified email address",
+        )
+
+    user = await get_user_by_email(email)
+
+    if user is None:
+        logger.info("Registering new user from Google login: %s", email)
+        user = await create_user_with_wallet(
+            email=email,
+            # A random password keeps the account unusable via the password form
+            # until the user deliberately sets one.
+            hashed_password=get_password_hash(secrets.token_urlsafe(32)),
+            full_name=id_info.get("name") or "Google User",
+        )
+    elif not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account has been deactivated",
+        )
+
+    return _token_response(user.email)

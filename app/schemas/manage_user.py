@@ -1,33 +1,40 @@
-from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List
-from uuid import UUID
 from datetime import datetime
 from decimal import Decimal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
 
 class UserWalletSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     credits: Decimal
-    updated_at: datetime
+    updated_at: datetime | None = None
+
 
 class UserAdminResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     email: EmailStr
-    full_name: Optional[str]
+    full_name: str | None = None
     is_active: bool
     is_superuser: bool
-    created_at: datetime
-    wallet: Optional[UserWalletSchema]
+    created_at: datetime | None = None
+    wallet: UserWalletSchema | None = None
 
-    class Config:
-        from_attributes = True
 
 class UserUpdateAdmin(BaseModel):
-    full_name: Optional[str] = None
-    is_active: Optional[bool] = None
-    is_superuser: Optional[bool] = None
-    credits: Optional[Decimal] = Field(None, ge=0)
+    model_config = ConfigDict(extra="forbid")
+
+    full_name: str | None = Field(None, max_length=120)
+    is_active: bool | None = None
+    is_superuser: bool | None = None
+    credits: Decimal | None = Field(None, ge=0)
+
 
 class UserListResponse(BaseModel):
-    users: List[UserAdminResponse]
+    users: list[UserAdminResponse]
     total_count: int
     page: int
     size: int

@@ -1,24 +1,24 @@
-import uuid
-from datetime import datetime, timezone
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Numeric, text
+from sqlalchemy import Boolean, Column, ForeignKey, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
-from app.core.database import Base
 
-def utc_now():
-    return datetime.now(timezone.utc)
+from app.models.base import Base, created_at_column, updated_at_column, uuid_pk
+
+# Credits granted to a brand new account.
+SIGNUP_BONUS_CREDITS = 10
+
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    id = uuid_pk()
     email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=True)
+    hashed_password = Column(String, nullable=True)  # null for OAuth-only accounts
     full_name = Column(String, nullable=True)
     is_active = Column(Boolean, default=True, server_default=text("true"), nullable=False)
     is_superuser = Column(Boolean, default=False, server_default=text("false"), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=utc_now)
-    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    created_at = created_at_column()
+    updated_at = updated_at_column()
 
     wallet = relationship("Wallet", back_populates="user", uselist=False, cascade="all, delete-orphan")
     chats = relationship("Chat", back_populates="user", cascade="all, delete-orphan")
@@ -27,13 +27,22 @@ class User(Base):
     videos = relationship("GeneratedVideo", back_populates="user", cascade="all, delete-orphan")
     transactions = relationship("Transaction", back_populates="user", cascade="all, delete-orphan")
 
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<User {self.email}>"
+
 
 class Wallet(Base):
     __tablename__ = "wallets"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    id = uuid_pk()
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), unique=True, nullable=False)
-    credits = Column(Numeric(18, 6), default=10.000000, server_default=text("10.0"), nullable=False)
-    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-    
+    # Numeric, never float: credits are money and must not drift.
+    credits = Column(
+        Numeric(18, 6),
+        default=SIGNUP_BONUS_CREDITS,
+        server_default=text("10.0"),
+        nullable=False,
+    )
+    updated_at = updated_at_column()
+
     user = relationship("User", back_populates="wallet")

@@ -1,615 +1,538 @@
-import uuid
+"""Chat history endpoints and the streaming WebSocket.
+
+The socket is long-lived while database work is short-lived, so each turn opens
+its own session instead of holding one open for the whole conversation — an idle
+transaction pinned to a socket is what exhausts a connection pool.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import json
-from decimal import Decimal
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, UploadFile, File, status
-from fastapi.websockets import WebSocketState
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import SQLAlchemyError, InterfaceError, OperationalError
-from sqlalchemy import select, desc, update
-from pydantic import BaseModel, ValidationError
-import redis.asyncio as redis
 import logging
+import uuid
+from datetime import datetime
+from decimal import Decimal
 
-from app.core.database import get_db, async_session_maker
-from app.core.redis import get_redis, ChatCache
-from app.core.security import verify_token_socket, get_current_user
-from app.models.user import User, Wallet
-from app.models.chat import Chat, Message
-from app.services.llm.factory import LLMFactory
-from app.services.llm.router import ModelRouter
-from app.services.llm.usage import Usage
-from app.services.llm.schema import ChatMessage, Attachment
+import redis.asyncio as redis
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.websockets import WebSocketState
+from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.database import get_db, session_scope
+from app.core.redis import ChatCache, get_redis
+from app.core.security import get_current_user, verify_token_socket
+from app.models.chat import ROLE_ASSISTANT, ROLE_USER, Chat, Message
+from app.models.user import User
+from app.services import billing
 from app.services.file_processing import process_file
-
+from app.services.llm.factory import LLMFactory
+from app.services.llm.models import UnknownModelError
+from app.services.llm.router import ModelRouter
+from app.services.llm.schema import Attachment, ChatMessage
+from app.services.llm.usage import Usage
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# WebSocket close codes
+WS_POLICY_VIOLATION = 1008
+WS_INTERNAL_ERROR = 1011
 
-# Helper Functions for Safe DB Operations
-
-async def safe_db_commit(db: AsyncSession) -> bool:
-    """Safely commit a transaction, handling connection errors."""
-    try:
-        await db.commit()
-        return True
-    except (SQLAlchemyError, InterfaceError, OperationalError, ConnectionResetError) as e:
-        logger.warning(f"Commit failed (connection may be closed): {type(e).__name__}")
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected commit error: {e}")
-        try:
-            await db.rollback()
-        except Exception:
-            pass
-        return False
-
-
-async def safe_db_refresh(db: AsyncSession, obj) -> bool:
-    """Safely refresh an object, handling connection errors."""
-    try:
-        await db.refresh(obj)
-        return True
-    except (SQLAlchemyError, InterfaceError, OperationalError, ConnectionResetError) as e:
-        logger.warning(f"Refresh failed (connection may be closed): {type(e).__name__}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected refresh error: {e}")
-        return False
-
-
-async def safe_websocket_send(websocket: WebSocket, data: dict) -> bool:
-    """Safely send data through WebSocket, handling disconnection."""
-    try:
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.send_json(data)
-            return True
-    except (WebSocketDisconnect, ConnectionResetError, RuntimeError) as e:
-        logger.debug(f"WebSocket send failed (client disconnected): {type(e).__name__}")
-    except Exception as e:
-        logger.warning(f"WebSocket send error: {type(e).__name__}: {e}")
-    return False
-
-
-async def safe_websocket_close(websocket: WebSocket, code: int = 1000, reason: str = "") -> None:
-    """Safely close WebSocket connection."""
-    try:
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close(code=code, reason=reason)
-    except Exception:
-        pass  # Already closed or connection lost
+MAX_MESSAGE_CHARS = 32_000
+CHAT_TITLE_CHARS = 40
 
 
 # Schemas
 
+
 class AttachmentSchema(BaseModel):
-    id: Optional[str] = None
-    name: str
-    type: str
-    size: int
-    mime_type: Optional[str] = None
+    id: str | None = None
+    name: str = ""
+    type: str = ""
+    size: int = 0
+    mime_type: str | None = None
 
 
 class MessageSchema(BaseModel):
+    model_config = {"from_attributes": True}
+
     id: uuid.UUID
     role: str
     content: str
-    model: Optional[str] = None
-    attachments: Optional[List[AttachmentSchema]] = []
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
+    model: str | None = None
+    attachments: list[AttachmentSchema] = Field(default_factory=list)
+    created_at: datetime | None = None
 
 
 class ChatSchema(BaseModel):
-    id: uuid.UUID
-    title: str
-    created_at: datetime
+    model_config = {"from_attributes": True}
 
-    class Config:
-        from_attributes = True
+    id: uuid.UUID
+    title: str | None = None
+    created_at: datetime | None = None
 
 
 class UserMessagePayload(BaseModel):
     type: str
-    content: str
-    attachments: Optional[List[AttachmentSchema]] = []
+    content: str = Field("", max_length=MAX_MESSAGE_CHARS)
+    attachments: list[AttachmentSchema] = Field(default_factory=list)
+    # Optional per-turn override. Without it a client has to reconnect to switch
+    # models, which drops the conversation mid-session.
+    model: str | None = None
 
 
-# HTTP Endpoints (GETs)
-
-@router.get("/history/{chat_id}", response_model=List[MessageSchema])
-async def get_chat_history(
-    chat_id: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    try:
-        chat_uuid = uuid.UUID(chat_id)
-    except ValueError:
-        return []
-
-    result = await db.execute(
-        select(Chat).where(Chat.id == chat_uuid, Chat.user_id == current_user.id)
-    )
-    chat = result.scalar_one_or_none()
-
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-
-    result = await db.execute(
-        select(Message)
-        .where(Message.chat_id == chat_uuid)
-        .order_by(Message.created_at.asc())
-    )
-    return result.scalars().all()
+# HTTP endpoints
 
 
-@router.delete("/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_chat(
-    chat_id: str,
+@router.get("/list", response_model=list[ChatSchema])
+async def get_user_chats(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    redis_client: redis.Redis = Depends(get_redis)
-):
-    """
-    Delete a chat session and its history.
-    """
-    try:
-        chat_uuid = uuid.UUID(chat_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid chat ID format")
-
-    # Fetch Chat and verify ownership
-    result = await db.execute(
-        select(Chat).where(Chat.id == chat_uuid, Chat.user_id == current_user.id)
-    )
-    chat = result.scalar_one_or_none()
-
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-
-    # Delete from DB
-    await db.delete(chat)
-    
-    if not await safe_db_commit(db):
-        raise HTTPException(status_code=500, detail="Failed to delete chat from database")
-
-    # Clear Redis Cache (History)
-    try:
-        await redis_client.delete(f"chat:{chat_id}:history")
-    except Exception as e:
-        logger.error(f"Failed to clear Redis cache for chat {chat_id}: {e}")
-
-    return None
-
-
-
-@router.get("/list", response_model=List[ChatSchema])
-async def get_user_chats(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
+) -> list[Chat]:
+    """The caller's chats, newest first."""
     result = await db.execute(
         select(Chat)
         .where(Chat.user_id == current_user.id)
         .order_by(desc(Chat.created_at))
+        .offset(offset)
+        .limit(limit)
     )
-    return result.scalars().all()
+    return list(result.scalars().all())
 
 
-# WebSocket Endpoint
+@router.get("/history/{chat_id}", response_model=list[MessageSchema])
+async def get_chat_history(
+    chat_id: uuid.UUID,
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[Message]:
+    """Full message history for one of the caller's chats."""
+    owns_chat = await db.scalar(
+        select(Chat.id).where(Chat.id == chat_id, Chat.user_id == current_user.id)
+    )
+    if not owns_chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+
+    result = await db.execute(
+        select(Message)
+        .where(Message.chat_id == chat_id)
+        .order_by(Message.created_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+@router.delete("/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat(
+    chat_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
+) -> None:
+    """Delete a chat, its messages and its cached history."""
+    chat = await db.scalar(
+        select(Chat).where(Chat.id == chat_id, Chat.user_id == current_user.id)
+    )
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+
+    await db.delete(chat)
+    await db.commit()
+
+    try:
+        await ChatCache(redis_client).clear_history(str(chat_id))
+    except Exception as exc:
+        # The durable copy is gone; a stale cache entry only wastes memory
+        # until its TTL expires.
+        logger.warning("Could not clear cached history for chat %s: %s", chat_id, exc)
+
+
+@router.post("/upload")
+async def upload_files_for_context(
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis),
+) -> dict:
+    """Stage files for the next chat message.
+
+    Extracted content is held in Redis under a short-lived id; only the id and
+    metadata go back to the client, so a large PDF never travels through the
+    WebSocket.
+    """
+    if len(files) > settings.MAX_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {settings.MAX_UPLOAD_FILES} files can be uploaded at once",
+        )
+
+    cache = ChatCache(redis_client)
+    processed: list[dict] = []
+
+    for file in files:
+        try:
+            result = await process_file(file)
+            file_id = str(uuid.uuid4())
+            await cache.save_temp_file(
+                file_id,
+                {
+                    "type": result["type"],
+                    "content": result["content"],
+                    "mime_type": result.get("mime_type"),
+                },
+            )
+            processed.append(
+                {
+                    "id": file_id,
+                    "name": result.get("filename", file.filename),
+                    "type": result["type"],
+                    "size": file.size,
+                    "mime_type": file.content_type,
+                }
+            )
+        except HTTPException as exc:
+            processed.append({"name": file.filename, "error": exc.detail})
+        except Exception:
+            logger.exception("Failed to process upload %s", file.filename)
+            processed.append({"name": file.filename, "error": "Could not process this file"})
+
+    return {"files": processed}
+
+
+# WebSocket helpers
+
+
+async def _send(websocket: WebSocket, data: dict) -> bool:
+    """Send JSON, reporting whether the client is still there."""
+    if websocket.client_state == WebSocketState.DISCONNECTED:
+        return False
+    try:
+        await websocket.send_json(data)
+        return True
+    except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
+        return False
+    except Exception as exc:
+        logger.warning("WebSocket send failed: %s", exc)
+        return False
+
+
+async def _close(websocket: WebSocket, code: int = 1000, reason: str = "") -> None:
+    try:
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            await websocket.close(code=code, reason=reason)
+    except Exception:
+        pass  # already gone
+
+
+async def _send_error(websocket: WebSocket, message: str) -> bool:
+    return await _send(websocket, {"type": "error", "message": message})
+
+
+def _chat_title(text: str, attachments: list[AttachmentSchema]) -> str:
+    """Derive a title from the first message."""
+    text = (text or "").strip()
+    if text:
+        return f"{text[:CHAT_TITLE_CHARS]}…" if len(text) > CHAT_TITLE_CHARS else text
+    if attachments:
+        # Attachments are validated models here; the previous dict-style lookup
+        # raised AttributeError whenever a file arrived without a name.
+        return f"File: {attachments[0].name or 'Attachment'}"
+    return "New Chat"
+
+
+async def _resolve_attachments(
+    cache: ChatCache, attachments: list[AttachmentSchema]
+) -> list[Attachment]:
+    """Swap staged upload ids for the content held in Redis."""
+    resolved: list[Attachment] = []
+    for item in attachments:
+        if not item.id:
+            continue
+        staged = await cache.get_temp_file(item.id)
+        if not staged:
+            logger.info("Staged file %s expired before it was sent", item.id)
+            continue
+        resolved.append(
+            Attachment(
+                type=staged["type"],
+                content=staged["content"],
+                mime_type=staged.get("mime_type"),
+            )
+        )
+    return resolved
+
+
+async def _load_history(
+    db: AsyncSession, cache: ChatCache, chat_id: uuid.UUID
+) -> list[ChatMessage]:
+    """Recent turns, from Redis when warm and from PostgreSQL otherwise."""
+    try:
+        history = await cache.get_history(str(chat_id))
+        if history:
+            return history
+    except Exception as exc:
+        logger.warning("Chat cache unavailable, falling back to the database: %s", exc)
+
+    result = await db.execute(
+        select(Message)
+        .where(Message.chat_id == chat_id)
+        .order_by(desc(Message.created_at))
+        .limit(settings.CHAT_HISTORY_LIMIT)
+    )
+    return [ChatMessage.from_text(m.role, m.content) for m in reversed(result.scalars().all())]
+
+
+# WebSocket endpoint
+
 
 @router.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
     model: str = "auto",
-    chat_id: Optional[str] = None,
+    chat_id: str | None = None,
     redis_client: redis.Redis = Depends(get_redis),
-):
-    """
-    WebSocket endpoint for real-time chat.
-    Uses isolated database sessions for each operation to handle disconnections gracefully.
+) -> None:
+    """Streaming chat.
+
+    Protocol — client sends ``{"type": "user_message", "content": str,
+    "attachments": [...]}``; the server replies with ``system`` events
+    (chat_id, route, cost), ``content`` deltas and ``error`` messages.
     """
     await websocket.accept()
     cache = ChatCache(redis_client)
-    
-    # Track connection state
-    is_connected = True
-    user: Optional[User] = None
-    current_chat: Optional[Chat] = None
-    current_chat_id: Optional[uuid.UUID] = None
-    wallet_id: Optional[int] = None
+
+    user_id: uuid.UUID | None = None
+    user_email = "unknown"
+    current_chat_id: uuid.UUID | None = None
 
     try:
-        # 1. Auth & Validation (using isolated session)
+        # Authentication and session setup
         token = websocket.query_params.get("token")
         if not token:
-            await safe_websocket_close(websocket, code=1008, reason="Missing token")
+            await _close(websocket, WS_POLICY_VIOLATION, "Missing token")
             return
 
-        async with async_session_maker() as db:
+        async with session_scope() as db:
             user = await verify_token_socket(token, db)
             if not user:
-                await safe_websocket_close(websocket, code=1008, reason="Invalid token")
+                await _close(websocket, WS_POLICY_VIOLATION, "Invalid token")
                 return
-            
-            # Store user ID for later use (don't keep the ORM object across sessions)
-            user_id = user.id
-            user_email = user.email
+            user_id, user_email = user.id, user.email
 
-            # 2. Initial Wallet Check (Read Only)
-            result = await db.execute(select(Wallet).where(Wallet.user_id == user_id))
-            wallet = result.scalar_one_or_none()
-
-            if not wallet or wallet.credits <= Decimal("0.0"):
-                await safe_websocket_send(websocket, {"type": "error", "message": "Insufficient credits."})
-                await safe_websocket_close(websocket, code=1008)
+            if not await billing.has_credits(db, user_id):
+                await _send_error(websocket, "Insufficient credits.")
+                await _close(websocket, WS_POLICY_VIOLATION, "Insufficient credits")
                 return
-            
-            wallet_id = wallet.id
 
-            # 3. Chat Loading
             if chat_id:
                 try:
-                    chat_uuid = uuid.UUID(chat_id)
-                    result = await db.execute(
-                        select(Chat).where(Chat.id == chat_uuid, Chat.user_id == user_id)
-                    )
-                    existing_chat = result.scalar_one_or_none()
-                    if existing_chat:
-                        current_chat_id = existing_chat.id
+                    requested = uuid.UUID(chat_id)
                 except ValueError:
-                    pass
+                    requested = None
+                if requested:
+                    current_chat_id = await db.scalar(
+                        select(Chat.id).where(Chat.id == requested, Chat.user_id == user_id)
+                    )
 
-        logger.info(f"WebSocket connected for user: {user_email}")
+        logger.info("WebSocket connected for %s", user_email)
 
-        # 4. Main Loop
-        while is_connected:
+        while True:
+            raw_data = await websocket.receive_text()
+
             try:
-                # Receive Raw Data
-                raw_data = await websocket.receive_text()
-                
-                # Parse User JSON
-                try:
-                    payload_data = json.loads(raw_data)
-                    payload = UserMessagePayload(**payload_data)
-                    
-                    if payload.type != "user_message":
-                        continue 
-                    
-                    user_text = payload.content
-                    raw_attachments = payload.attachments
-                    
-                except (json.JSONDecodeError, ValidationError) as e:
-                    logger.error(f"Validation error: {e}")
-                    await safe_websocket_send(websocket, {"type": "error", "message": "Invalid message format"})
-                    continue
+                payload = UserMessagePayload(**json.loads(raw_data))
+            except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+                logger.info("Rejected malformed WebSocket payload: %s", exc)
+                await _send_error(websocket, "Invalid message format")
+                continue
 
-                # Process message with isolated database session
-                async with async_session_maker() as db:
-                    # Lazy Chat Creation
-                    if not current_chat_id:
-                        # Logic: Title = Text -> First Attachment Name -> "New Chat"
-                        if user_text and user_text.strip():
-                            title = user_text[:40] + "..." if len(user_text) > 40 else user_text
-                        elif raw_attachments:
-                            # Use the name of the first attachment
-                            first_file = raw_attachments[0]
-                            # Handle both Pydantic model (dot notation) or dict (bracket notation) just in case
-                            fname = getattr(first_file, 'name', None) or first_file.get('name') or "Attachment"
-                            title = f"File: {fname}"
-                        else:
-                            title = "New Chat"
+            if payload.type != "user_message":
+                continue
 
-                        new_chat = Chat(user_id=user_id, title=title)
-                        db.add(new_chat)
-                        
-                        if not await safe_db_commit(db):
-                            await safe_websocket_send(websocket, {"type": "error", "message": "Failed to create chat"})
-                            continue
-                        
-                        await safe_db_refresh(db, new_chat)
-                        current_chat_id = new_chat.id
-                        
-                        # Send the new ID back to frontend
-                        if not await safe_websocket_send(websocket, {
-                            "type": "system",
-                            "event": "chat_id",
-                            "payload": str(current_chat_id)
-                        }):
-                            is_connected = False
-                            break
+            user_text = payload.content
 
-                    # Model Routing
-                    selected_model = ModelRouter.determine_model(user_text, model)
-                    
-                    if not await safe_websocket_send(websocket, {
-                        "type": "system",
-                        "event": "route",
-                        "payload": selected_model
-                    }):
-                        is_connected = False
-                        break
+            # Balance is re-checked every turn: the original code only checked at
+            # connect time, so one socket could keep generating on an empty wallet.
+            async with session_scope() as db:
+                if not await billing.has_credits(db, user_id):
+                    await _send_error(websocket, "Insufficient credits. Please top up.")
+                    await _close(websocket, WS_POLICY_VIOLATION, "Insufficient credits")
+                    return
 
-                    # Prepare Attachments for LLM
-                    current_attachments_for_llm = []
-                    
-                    if raw_attachments:
-                        for att in raw_attachments:
-                            # Use dot notation for Pydantic models
-                            file_id = att.id 
-                            
-                            if file_id:
-                                # Fetch heavy content from Redis
-                                file_data = await cache.get_temp_file(file_id)
-                                
-                                if file_data:
-                                    current_attachments_for_llm.append(Attachment(
-                                        type=file_data["type"],
-                                        content=file_data["content"],
-                                        mime_type=file_data.get("mime_type")
-                                    ))
+            try:
+                selected_model = ModelRouter.determine_model(user_text, payload.model or model)
+            except UnknownModelError as exc:
+                await _send_error(websocket, str(exc))
+                continue
 
-                    # Prepare Metadata for Database
-                    metadata_attachments_for_db = []
-                    if raw_attachments:
-                        for att in raw_attachments:
-                            # Use dot notation or .model_dump()/.dict()
-                            metadata_attachments_for_db.append({
-                                "name": att.name,
-                                "type": att.type,
-                                "size": att.size,
-                                "mime_type": att.mime_type
-                            })
+            # Lazily create the chat on the first message.
+            if current_chat_id is None:
+                async with session_scope() as db:
+                    chat = Chat(user_id=user_id, title=_chat_title(user_text, payload.attachments))
+                    db.add(chat)
+                    await db.flush()
+                    current_chat_id = chat.id
 
-                    # Save User Message to DB
-                    user_msg = Message(
+                if not await _send(
+                    websocket,
+                    {"type": "system", "event": "chat_id", "payload": str(current_chat_id)},
+                ):
+                    return
+
+            # Sending happens outside the transaction: a write held open across
+            # a network round-trip to the client is how connections get pinned.
+            if not await _send(
+                websocket, {"type": "system", "event": "route", "payload": selected_model}
+            ):
+                return
+
+            llm_attachments = await _resolve_attachments(cache, payload.attachments)
+
+            async with session_scope() as db:
+                db.add(
+                    Message(
                         chat_id=current_chat_id,
-                        role="user",
+                        role=ROLE_USER,
                         content=user_text,
                         model=selected_model,
-                        attachments=metadata_attachments_for_db,
+                        attachments=[a.model_dump(exclude={"id"}) for a in payload.attachments],
                     )
+                )
+                # autoflush is off, so this query returns the previous turns only.
+                history = await _load_history(db, cache, current_chat_id)
 
-                    db.add(user_msg)
-                    if not await safe_db_commit(db):
-                        await safe_websocket_send(websocket, {"type": "error", "message": "Failed to save message"})
+            try:
+                await cache.add_message(str(current_chat_id), ROLE_USER, user_text)
+            except Exception as exc:
+                logger.warning("Could not cache the user message: %s", exc)
 
-                    # Add to Cache
-                    try:
-                        await cache.add_message(str(current_chat_id), "user", user_text)
-                    except Exception:
-                        pass
+            # The cached/stored copy of this turn has no attachment payloads, so
+            # replace it with the rich version before sending it to the model.
+            latest = ChatMessage.from_text(ROLE_USER, user_text)
+            latest.attachments = llm_attachments
+            if history and history[-1].role == ROLE_USER and history[-1].text == user_text:
+                history[-1] = latest
+            else:
+                history.append(latest)
 
-                    # Context Fetching
-                    conversation_history: List[ChatMessage] = []
-                    try:
-                        conversation_history = await cache.get_history(str(current_chat_id), limit=10)
-                    except Exception:
-                        pass
+            # Generate
+            usage = Usage()
+            full_response = ""
+            client_gone = False
+            stream = None
 
-                    if not conversation_history:
-                        result = await db.execute(
-                            select(Message)
-                            .where(Message.chat_id == current_chat_id)
-                            .order_by(desc(Message.created_at))
-                            .limit(10)
-                        )
-                        msgs = result.scalars().all()
-                        for msg in reversed(msgs):
-                            conversation_history.append(ChatMessage.from_text(msg.role, msg.content))
-
-                    # Parse Attachments for CURRENT message context
-                    current_attachments = []
-                    for att in raw_attachments:
-                        if "type" in att and "content" in att:
-                            current_attachments.append(Attachment(
-                                type=att["type"],
-                                content=att["content"],
-                                mime_type=att.get("mime_type")
-                            ))
-
-                    # Append current message WITH attachments to history
-                    latest_msg = ChatMessage.from_text("user", user_text)
-                    # Use the resolved content from Redis
-                    latest_msg.attachments = current_attachments_for_llm
-                    
-                    # If the last message fetched from history/cache is the same text,
-                    # replace it with the rich version containing attachments.
-                    if conversation_history and conversation_history[-1].role == "user" and conversation_history[-1].content[0].text == user_text:
-                        conversation_history[-1] = latest_msg
-                    else:
-                        conversation_history.append(latest_msg)
-
-
-                # AI Generation
+            try:
                 provider = LLMFactory.get_provider(selected_model)
-                usage = Usage()
-                full_response = ""
-                cancel_event = asyncio.Event()
+                stream = provider.generate_stream(history, selected_model, usage)
 
-                async def stream_response():
-                    nonlocal full_response, is_connected
-                    async for chunk in provider.generate_stream(
-                        conversation_history,
-                        selected_model,
-                        usage,
-                    ):
-                        if cancel_event.is_set():
-                            break
+                async with asyncio.timeout(settings.CHAT_STREAM_TIMEOUT_SECONDS):
+                    async for chunk in stream:
                         full_response += chunk
-                        
-                        if not await safe_websocket_send(websocket, {
-                            "type": "content", 
-                            "delta": chunk
-                        }):
-                            is_connected = False
-                            cancel_event.set()
+                        if not await _send(websocket, {"type": "content", "delta": chunk}):
+                            client_gone = True
                             break
+            except (WebSocketDisconnect, ConnectionResetError):
+                client_gone = True
+            except TimeoutError:
+                await _send_error(websocket, "The model took too long to respond.")
+            except Exception as exc:
+                logger.exception("Generation failed with %s", selected_model)
+                # Provider errors can name keys and endpoints; only echo them
+                # back to the client outside production.
+                detail = "Generation failed. Please try again."
+                if not settings.is_production:
+                    detail = f"Generation failed: {exc}"
+                await _send_error(websocket, detail)
+            finally:
+                if stream is not None:
+                    # Closing the generator ends the upstream HTTP request rather
+                    # than leaving it streaming tokens nobody reads.
+                    with contextlib.suppress(Exception):
+                        await stream.aclose()
 
-                stream_task = asyncio.create_task(stream_response())
+            # Bill for whatever was produced, even if the client vanished mid-stream.
+            usage.ensure_validity(prompt_text=user_text, completion_text=full_response)
+            if not full_response.strip():
+                if client_gone:
+                    return
+                continue
 
-                try:
-                    await asyncio.wait_for(stream_task, timeout=60)
-                except WebSocketDisconnect:
-                    cancel_event.set()
-                    stream_task.cancel()
-                    is_connected = False
-                    # Still need to bill for what was generated
-                except asyncio.TimeoutError:
-                    cancel_event.set()
-                    stream_task.cancel()
-                    await safe_websocket_send(websocket, {"type": "error", "message": "Error: Timeout"})
-                except asyncio.CancelledError:
-                    cancel_event.set()
-                    is_connected = False
-                except Exception as e:
-                    cancel_event.set()
-                    stream_task.cancel()
-                    err_msg = str(e)
-                    await safe_websocket_send(websocket, {"type": "error", "message": f"Error: {err_msg}"})
-                    if not full_response:
-                        continue
+            cost = await _record_turn(
+                user_id=user_id,
+                chat_id=current_chat_id,
+                model=selected_model,
+                response=full_response,
+                usage=usage,
+            )
 
-                # Validity Check
-                usage.ensure_validity(prompt_text=user_text, completion_text=full_response)
-                if not full_response.strip() and usage.total_tokens == 0:
-                    if not is_connected:
-                        break
-                    continue
+            try:
+                await cache.add_message(str(current_chat_id), ROLE_ASSISTANT, full_response)
+            except Exception as exc:
+                logger.warning("Could not cache the assistant message: %s", exc)
 
-                # Billing & Atomic Deduction (in new isolated session)
-                async with async_session_maker() as db:
-                    try:
-                        total_cost_to_user = provider.calculate_cost(usage, selected_model)
-                        
-                        stmt = (
-                            update(Wallet)
-                            .where(Wallet.user_id == user_id)
-                            .values(credits=Wallet.credits - total_cost_to_user)
-                            .execution_options(synchronize_session="fetch")
-                        )
-                        await db.execute(stmt)
-                        await safe_db_commit(db)
-                        
-                        # Check wallet balance
-                        result = await db.execute(select(Wallet).where(Wallet.user_id == user_id))
-                        updated_wallet = result.scalar_one_or_none()
-                        
-                        if updated_wallet and updated_wallet.credits < 0:
-                            await safe_websocket_send(websocket, {
-                                "type": "system",
-                                "event": "warning",
-                                "payload": "Balance exhausted. Please top up."
-                            })
+            if client_gone:
+                return
 
-                        # Save AI Message
-                        ai_msg = Message(
-                            chat_id=current_chat_id,
-                            role="ai",
-                            content=full_response,
-                            model=selected_model,
-                            cost=total_cost_to_user,
-                            tokens=usage.total_tokens,
-                        )
-                        db.add(ai_msg)
-                        await safe_db_commit(db)
-
-                    except Exception as e:
-                        logger.error(f"Error in billing/saving: {e}")
-                        # Don't fail completely - response was already sent
-
-                # Cache AI response
-                try:
-                    await cache.add_message(str(current_chat_id), "ai", full_response)
-                except Exception:
-                    pass
-                
-                # Send cost info
-                if is_connected:
-                    await safe_websocket_send(websocket, {
-                        "type": "system",
-                        "event": "cost",
-                        "payload": str(total_cost_to_user)
-                    })
-
-                # Check if we should exit the loop
-                if not is_connected:
-                    break
-
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected for user: {user_email}")
-                is_connected = False
-                break
-            except ConnectionResetError:
-                logger.info(f"Connection reset for user: {user_email} (client closed abruptly)")
-                is_connected = False
-                break
+            await _send(websocket, {"type": "system", "event": "cost", "payload": str(cost)})
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected during setup")
+        logger.info("WebSocket disconnected for %s", user_email)
     except ConnectionResetError:
-        logger.info(f"Connection reset during setup (client closed abruptly)")
-    except Exception as e:
-        logger.error(f"Critical WebSocket Error: {type(e).__name__}: {e}")
-        await safe_websocket_close(websocket, code=1011)
+        logger.info("WebSocket reset by %s", user_email)
+    except Exception:
+        logger.exception("Unhandled WebSocket error for %s", user_email)
+        await _close(websocket, WS_INTERNAL_ERROR)
     finally:
-        if user:
-            logger.info(f"WebSocket cleanup completed for user: {user_email}")
-        else:
-            logger.info("WebSocket cleanup completed (user not authenticated)")
-        
+        logger.info("WebSocket closed for %s", user_email)
 
-@router.post("/upload")
-async def upload_files_for_context(
-    files: List[UploadFile] = File(...),
-    current_user: dict = Depends(get_current_user),
-    redis_client: redis.Redis = Depends(get_redis) 
-):
-    processed_metadata = []
-    cache = ChatCache(redis_client)
-    
-    for file in files:
-        try:
-            # Process the file (Extract text/base64)
-            result = await process_file(file)
-            
-            # Generate a reference ID
-            file_id = str(uuid.uuid4())
-            
-            # Store CONTENT in Redis
-            # We store the heavy extracted content here
-            file_content_payload = {
-                "type": result["type"],
-                "content": result["content"],
-                "mime_type": result.get("mime_type")
-            }
-            await cache.save_temp_file(file_id, file_content_payload)
 
-            # Return METADATA + ID to Frontend
-            processed_metadata.append({
-                "id": file_id,
-                "name": result.get("filename", file.filename),
-                "type": result["type"],
-                "size": file.size,
-                "mime_type": file.content_type
-            })
-            
-        except Exception as e:
-            logger.error(f"Upload error: {e}")
-            processed_metadata.append({
-                "filename": file.filename,
-                "error": str(e)
-            })
-            
-    return {"files": processed_metadata}
+async def _record_turn(
+    user_id: uuid.UUID,
+    chat_id: uuid.UUID,
+    model: str,
+    response: str,
+    usage: Usage,
+) -> Decimal:
+    """Charge for a completed turn and store the assistant message.
+
+    The response has already been delivered, so the debit is allowed to overdraw;
+    the next turn's balance check stops the user before they can spend more.
+    """
+    provider = LLMFactory.get_provider(model)
+    cost = provider.calculate_cost(usage, model)
+
+    try:
+        async with session_scope() as db:
+            await billing.debit(db, user_id, cost, allow_overdraft=True)
+            db.add(
+                Message(
+                    chat_id=chat_id,
+                    role=ROLE_ASSISTANT,
+                    content=response,
+                    model=model,
+                    cost=cost,
+                    tokens=usage.total_tokens,
+                )
+            )
+    except Exception:
+        # Never fail the conversation over bookkeeping — but make it findable.
+        logger.exception("Failed to record turn for user %s (cost %s)", user_id, cost)
+
+    return cost

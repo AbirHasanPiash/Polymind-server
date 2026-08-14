@@ -1,49 +1,40 @@
+"""Maps a model id to the adapter that can serve it."""
+
+from __future__ import annotations
+
 from app.services.llm.base import LLMProvider
-from app.services.llm.openai_adapter import OpenAIAdapter
-from app.services.llm.gemini_adapter import GeminiAdapter
 from app.services.llm.claude_adapter import ClaudeAdapter
+from app.services.llm.gemini_adapter import GeminiAdapter
+from app.services.llm.models import (
+    PROVIDER_ANTHROPIC,
+    PROVIDER_GOOGLE,
+    PROVIDER_OPENAI,
+    ModelSpec,
+    get_spec,
+    list_models,
+)
+from app.services.llm.openai_adapter import OpenAIAdapter
+
+# Adapters are stateless in front of a shared client, so one instance each is enough.
+_ADAPTERS: dict[str, LLMProvider] = {
+    PROVIDER_OPENAI: OpenAIAdapter(),
+    PROVIDER_ANTHROPIC: ClaudeAdapter(),
+    PROVIDER_GOOGLE: GeminiAdapter(),
+}
+
 
 class LLMFactory:
-    """
-    The Factory is responsible for selecting the right AI Provider
-    based on the requested model string.
-    """
-    
+    """Resolves models to providers, rejecting anything outside the registry."""
+
     @staticmethod
     def get_provider(model: str) -> LLMProvider:
-        model_id = model.lower()
+        """Return the adapter for ``model``.
 
-        if model_id.startswith("gpt"):
-            return OpenAIAdapter()
-        
-        elif model_id.startswith("gemini"):
-            return GeminiAdapter()
-        
-        elif model_id.startswith("claude"):
-            return ClaudeAdapter()
-        
-        else:
-            raise ValueError(f"Unsupported AI Model: {model}")
+        Raises ``UnknownModelError`` for ids that are not in the registry, so an
+        arbitrary client-supplied string can never reach a provider.
+        """
+        return _ADAPTERS[get_spec(model).provider]
 
     @staticmethod
-    def get_all_models():
-        """
-        Helper to return a list of all supported models for the Frontend.
-        """
-        return [
-            # OpenAI
-            "gpt-5.2-pro", 
-            "gpt-5.2", 
-            "gpt-5-mini",
-            
-            # Google
-            "gemini-2.5-pro", 
-            "gemini-2.5-flash", 
-            "gemini-3-pro-preview", 
-            "gemini-3-flash-preview",
-
-            # Anthropic
-            "claude-4.5-opus",
-            "claude-4.5-sonnet",
-            "claude-4.5-haiku"
-        ]
+    def get_all_models() -> list[ModelSpec]:
+        return list_models()

@@ -1,139 +1,148 @@
-from typing import Optional
+"""Intent-based model selection for "auto" mode.
+
+The prompt is scored against four keyword families; the highest-scoring family
+picks the model best suited to it. An explicit user preference always wins, but
+it is validated against the model registry first.
+"""
+
+from __future__ import annotations
+
 import re
 
+from app.services.llm.models import (
+    DEFAULT_CODING_MODEL,
+    DEFAULT_FAST_MODEL,
+    DEFAULT_LONG_CONTEXT_MODEL,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_MODEL,
+    get_spec,
+)
+
+AUTO = "auto"
+
+# Prompts longer than this are routed to the large-context model regardless of topic.
+LONG_PROMPT_CHARS = 4000
+# Prompts shorter than this go to the fastest model when no intent is detected.
+SHORT_PROMPT_CHARS = 150
+
+
+def _compile(patterns: list[str]) -> re.Pattern[str]:
+    """Merge keyword groups into one case-insensitive pattern.
+
+    One pass over the text per family instead of one pass per keyword group —
+    this runs on every chat message, so the difference is worth the merge.
+    """
+    return re.compile("|".join(f"(?:{p})" for p in patterns), re.IGNORECASE)
+
+
 class ModelRouter:
-    """
-    Advanced Router to select the best AI model based on user intent scoring.
-    """
-    
-    # Expanded Keyword Patterns
-    
     CODING_PATTERNS = [
-        # Core Syntax & Languages
-        r"\b(def|class|import|function|const|let|var|return|await|async)\b",
-        r"\b(struct|impl|interface|package|namespace|void|public|private)\b", # Java/C++/Rust/Go
+        # Core syntax & languages
+        r"\b(code|codes|def|class|import|function|const|let|var|return|await|async)\b",
+        r"\b(struct|impl|interface|package|namespace|void|public|private)\b",
         r"\b(python|javascript|typescript|golang|rust|java|c\+\+|swift|kotlin)\b",
-        r"\b(bash|shell|powershell|zsh|chmod|sudo|grep|sed|awk)\b", # DevOps/Terminal
-        
-        # Web Frameworks & Libraries
+        r"\b(bash|shell|powershell|zsh|chmod|sudo|grep|sed|awk)\b",
+        # Web frameworks & libraries
         r"\b(react|vue|angular|svelte|next\.?js|nuxt|node\.?js|express)\b",
         r"\b(fastapi|django|flask|spring boot|laravel|rails|asp\.net)\b",
         r"\b(tailwind|bootstrap|css|sass|html|jsx|tsx|component)\b",
         r"\b(redux|zustand|context api|hooks|middleware|auth)\b",
-
-        # Infrastructure & Tools
+        # Infrastructure & tooling
         r"\b(docker|kubernetes|k8s|aws|azure|gcp|terraform|ansible)\b",
         r"\b(git|github|gitlab|ci/cd|pipeline|jenkins|actions)\b",
         r"\b(npm|pip|yarn|cargo|maven|gradle|composer)\b",
         r"\b(linux|ubuntu|centos|debian|alpine|ssh|nginx|apache)\b",
-
-        # Debugging & Concepts
+        # Debugging & concepts
         r"\b(bug|error|exception|stacktrace|traceback|undefined|null|segfault)\b",
         r"\b(refactor|optimize|complexity|big o|algorithm|structure)\b",
         r"\b(api|rest|graphql|grpc|websocket|endpoint|json|xml|yaml)\b",
-        r"\b(db|database|sql|postgres|mysql|mongodb|redis|orm|sqlalchemy)\b"
+        r"\b(db|database|sql|postgres|mysql|mongodb|redis|orm|sqlalchemy)\b",
     ]
-    
+
     REASONING_PATTERNS = [
-        # Math & Logic
+        # Math & logic
         r"\b(solve|calculate|compute|prove|derive|evaluate)\b",
         r"\b(math|algebra|calculus|geometry|trigonometry|statistics|probability)\b",
         r"\b(logic|theorem|axiom|lemma|proof|contradiction|fallacy)\b",
-        
-        # Analysis & Strategy
+        # Analysis & strategy
         r"\b(analyze|critique|compare|contrast|pros and cons|trade-off)\b",
         r"\b(strategy|plan|roadmap|methodology|framework|approach)\b",
         r"\b(why|how does|explain|implication|consequence|causality)\b",
         r"\b(troubleshoot|diagnose|root cause|investigate)\b",
-
-        # Science & Academic
+        # Science & academia
         r"\b(physics|chemistry|biology|quantum|relativity|thermodynamics)\b",
         r"\b(research|hypothesis|experiment|study|citation|reference)\b",
-        r"\b(economic|market|financial|investment|crypto|blockchain)\b"
+        r"\b(economic|market|financial|investment|crypto|blockchain)\b",
     ]
-    
+
     CREATIVE_PATTERNS = [
-        # Writing Formats
+        # Writing formats
         r"\b(write|compose|draft|create|generate|brainstorm)\b",
         r"\b(story|poem|essay|blog|article|email|letter|speech)\b",
         r"\b(script|screenplay|dialogue|lyrics|song|haiku|sonnet)\b",
         r"\b(tweet|post|caption|headline|tagline|slogan|copy)\b",
-
-        # Narrative Elements
+        # Narrative elements
         r"\b(imagine|scenario|fiction|fantasy|sci-fi|plot|twist)\b",
         r"\b(character|protagonist|antagonist|setting|world-building)\b",
         r"\b(tone|style|voice|mood|atmosphere|metaphor|simile)\b",
-        
-        # Professional/Marketing
+        # Professional / marketing
         r"\b(marketing|proposal|pitch|presentation|resume|cover letter)\b",
-        r"\b(branding|identity|mission|vision|value proposition)\b"
+        r"\b(branding|identity|mission|vision|value proposition)\b",
     ]
-    
+
     DATA_PATTERNS = [
-        # Data Actions
+        # Data actions
         r"\b(summarize|summary|extract|key points|tl;dr|abstract)\b",
         r"\b(visualize|plot|chart|graph|dashboard|heatmap)\b",
         r"\b(clean|transform|process|parse|scrape|crawl)\b",
-        
-        # Data Formats & Tools
+        # Formats & tools
         r"\b(dataset|csv|excel|spreadsheet|dataframe|jsonl|parquet)\b",
         r"\b(pandas|numpy|matplotlib|seaborn|scikit|pytorch|tensorflow)\b",
-        
-        # Analysis Terms
+        # Analysis terms
         r"\b(pattern|trend|insight|correlation|outlier|anomaly)\b",
-        r"\b(report|audit|review|assessment|log analysis)\b"
+        r"\b(report|audit|review|assessment|log analysis)\b",
     ]
 
-    @classmethod
-    def _calculate_score(cls, text: str, patterns: list) -> int:
-        score = 0
-        text_lower = text.lower()
-        for pattern in patterns:
-            # Count how many times these patterns appear
-            matches = re.findall(pattern, text_lower)
-            score += len(matches)
-        return score
+    _CODING = _compile(CODING_PATTERNS)
+    _REASONING = _compile(REASONING_PATTERNS)
+    _CREATIVE = _compile(CREATIVE_PATTERNS)
+    _DATA = _compile(DATA_PATTERNS)
+
+    @staticmethod
+    def _score(text: str, pattern: re.Pattern[str]) -> int:
+        return sum(1 for _ in pattern.finditer(text))
 
     @classmethod
-    def determine_model(cls, prompt: str, user_preference: Optional[str] = None) -> str:
+    def determine_model(cls, prompt: str, user_preference: str | None = None) -> str:
+        """Return the model id to use.
+
+        An explicit ``user_preference`` other than "auto" is validated against the
+        registry and returned; unknown ids raise ``UnknownModelError`` rather than
+        being forwarded to a provider.
         """
-        Returns the Model ID to be used by the Factory.
-        """
+        if user_preference and user_preference.lower() != AUTO:
+            return get_spec(user_preference).id
 
-        # User Override
-        if user_preference and user_preference.lower() != "auto":
-            return user_preference
+        prompt = prompt or ""
+        coding = cls._score(prompt, cls._CODING)
+        reasoning = cls._score(prompt, cls._REASONING)
+        creative = cls._score(prompt, cls._CREATIVE)
+        data = cls._score(prompt, cls._DATA)
 
-        # Score the Prompt
-        coding_score = cls._calculate_score(prompt, cls.CODING_PATTERNS)
-        reasoning_score = cls._calculate_score(prompt, cls.REASONING_PATTERNS)
-        creative_score = cls._calculate_score(prompt, cls.CREATIVE_PATTERNS)
-        data_score = cls._calculate_score(prompt, cls.DATA_PATTERNS)
+        # Coding intent wins ties: a mislabelled coding prompt is the costliest miss.
+        if coding > 0 and coding >= max(reasoning, creative, data):
+            return DEFAULT_CODING_MODEL
 
-        # Decision Logic
+        if (data > 0 and data >= max(reasoning, creative)) or len(prompt) > LONG_PROMPT_CHARS:
+            return DEFAULT_LONG_CONTEXT_MODEL
 
-        # High Coding Intent -> Claude 4.5 Opus (Excellent at complex architecture & refactoring)
-        if coding_score > 0 and coding_score >= max(reasoning_score, creative_score, data_score):
-            return "claude-4.5-opus"
+        if reasoning > 0 and reasoning >= max(creative, data):
+            return DEFAULT_REASONING_MODEL
 
-        # Heavy Data/Context -> Gemini 2.5 Pro (Massive Context Window)
-        # Check if data score is high OR if the prompt is significantly long
-        if (data_score > 0 and data_score >= max(reasoning_score, creative_score)) or len(prompt) > 4000:
-            return "gemini-2.5-pro"
-        
-        # Deep Reasoning/Math -> GPT-5.2 Pro (Strong logical deduction)
-        if reasoning_score > 0 and reasoning_score >= max(creative_score, data_score):
-            return "gpt-5.2-pro"
+        if creative > 0:
+            return DEFAULT_LONG_CONTEXT_MODEL
 
-        # Creative Writing -> Gemini 2.5 Pro (Often more fluid/imaginative)
-        if creative_score > 0:
-            return "gemini-2.5-pro"
-            
-        # 4. Fallback Logic based on Length
-        
-        # Very Short/Conversational -> Gemini 3 Flash (Fastest response time)
-        if len(prompt) < 150:
-            return "gemini-3-flash-preview"
+        if len(prompt) < SHORT_PROMPT_CHARS:
+            return DEFAULT_FAST_MODEL
 
-        # Default Standard -> GPT-5.2 (Safe, balanced default)
-        return "gpt-5.2"
+        return DEFAULT_MODEL

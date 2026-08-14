@@ -1,60 +1,70 @@
-from pydantic import BaseModel
-from uuid import UUID
 from datetime import datetime
-from typing import Optional
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.services.media.tts_google import DEFAULT_VOICE, MAX_TTS_CHARS
+
+MAX_PROMPT_LENGTH = 4000
+
+
+class AudioGenerationRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=MAX_TTS_CHARS)
+    voice_name: str = DEFAULT_VOICE
+
 
 class GeneratedAudioResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     public_url: str
     text_prompt: str
-    voice_name: Optional[str]
+    voice_name: str | None = None
     provider: str
-    cost: float
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
+    cost: float  # display value; the ledger keeps full Decimal precision
+    created_at: datetime | None = None
 
 
 class ImageGenerationRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(..., min_length=1, max_length=MAX_PROMPT_LENGTH)
     model: str = "gpt-image-1.5"
     size: str = "1024x1024"
-    quality: str = "standard"
-    reference_image_url: Optional[str] = None
-    n: int = 1
+    quality: str = "medium"
+    reference_image_url: str | None = None
+
 
 class GeneratedImageResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     public_url: str
     prompt: str
-    reference_image_url: Optional[str]
-    model: str 
+    reference_image_url: str | None = None
+    revised_prompt: str | None = None
+    model: str
     size: str
     quality: str
-    cost: float
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
+    cost: float  # display value; the ledger keeps full Decimal precision
+    created_at: datetime | None = None
 
 
 class VideoGenerationRequest(BaseModel):
-    text: str
-    voice_name: str = "en-US-Neural2-F"
+    text: str = Field(..., min_length=1, max_length=MAX_TTS_CHARS)
+    voice_name: str = DEFAULT_VOICE
     avatar_url: str
-    provider: str = "d-id"
 
 
 class GeneratedVideoResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
-    public_url: Optional[str] = None
-    thumbnail_url: Optional[str] = None
+    public_url: str | None = None
+    thumbnail_url: str | None = None
     status: str
-    text_prompt: str = ""
-    avatar_image_url: str 
-    cost: float
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
+    # Mapped from the model's ``script_text`` column, which the previous field
+    # name did not match — the response always came back empty.
+    script_text: str
+    avatar_image_url: str
+    error_message: str | None = None
+    cost: float  # display value; the ledger keeps full Decimal precision
+    created_at: datetime | None = None

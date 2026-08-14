@@ -1,24 +1,77 @@
 services:
-  # Web Service (FastAPI)
+  # FastAPI web service
   - type: web
     name: multi-model-ai
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # /health reports database and Redis connectivity (the old path did not exist).
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.0"
+      - key: ENVIRONMENT
+        value: production
       - key: REDIS_URL
         fromService:
           type: redis
           name: fastapi-redis
           property: connectionString
-    healthCheckPath: /health
+      # Secrets are set in the Render dashboard, never committed here.
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: DID_API_KEY
+        sync: false
+      - key: STORAGE_ENDPOINT
+        sync: false
+      - key: STORAGE_ACCESS_KEY
+        sync: false
+      - key: STORAGE_SECRET_KEY
+        sync: false
+      - key: STORAGE_BUCKET_NAME
+        sync: false
+      - key: STORAGE_PUBLIC_URL
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
 
-  # Redis Service
   - type: redis
     name: fastapi-redis
     plan: free
     maxmemoryPolicy: allkeys-lru
     ipAllowList: []
+
+# Media generation (image, speech, avatar video) needs a Celery worker. Render
+# workers are a paid instance type, so it is left commented out — uncomment and
+# copy the env vars above to enable it:
+#
+#  - type: worker
+#    name: multi-model-ai-worker
+#    runtime: python
+#    plan: starter
+#    buildCommand: pip install -r requirements.txt
+#    startCommand: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+#
+# Migrations are not run automatically here: apply them with
+# `alembic upgrade head` from a shell (or a pre-deploy command on a paid plan).

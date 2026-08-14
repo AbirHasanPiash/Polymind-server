@@ -1,118 +1,80 @@
-import json
+"""OpenAI chat-completions adapter."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+
 import openai
-from decimal import Decimal
-from typing import AsyncGenerator, List, Dict, Union
+
 from app.core.config import settings
-from app.services.llm.base import LLMProvider, PromptType
-from app.services.llm.usage import Usage
+from app.services.llm.base import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    LLMProvider,
+    PromptType,
+    ProviderNotConfiguredError,
+)
 from app.services.llm.schema import ChatMessage
+from app.services.llm.usage import Usage
+
 
 class OpenAIAdapter(LLMProvider):
+    # One client per process: it owns an HTTP connection pool that should be reused.
     _client: openai.AsyncOpenAI | None = None
 
-    # 4X Profit Margin
-    PROFIT_MARGIN = Decimal("4.0")
-    USD_TO_CREDITS_RATE = Decimal("10.0")
-
-    def __init__(self):
-        if not OpenAIAdapter._client:
+    @property
+    def client(self) -> openai.AsyncOpenAI:
+        if OpenAIAdapter._client is None:
+            if not settings.OPENAI_API_KEY:
+                raise ProviderNotConfiguredError("OpenAI", "OPENAI_API_KEY")
             OpenAIAdapter._client = openai.AsyncOpenAI(
-                api_key=settings.OPENAI_API_KEY
+                api_key=settings.OPENAI_API_KEY,
+                max_retries=2,
+                timeout=120.0,
             )
-        self.client = OpenAIAdapter._client
+        return OpenAIAdapter._client
 
-        # Pricing (USD per 1M tokens)
-        self.pricing = {
-            "gpt-5.2-pro": {"input": Decimal("21.00"), "output": Decimal("168.00")},
-            "gpt-5.2": {"input": Decimal("1.75"), "output": Decimal("14.00")},
-            "gpt-5-mini": {"input": Decimal("0.25"), "output": Decimal("2.00")},
-        }
-
-    def calculate_cost(self, usage: Usage, model: str) -> Decimal:
-        """
-        Calculates Price to User (Cost * Margin).
-        Returns Decimal for high precision.
-        """
-        price_tier = self.pricing.get(model, self.pricing["gpt-5.2"])
-        
-        # Calculate Base Provider Cost
-        input_cost = (Decimal(usage.prompt_tokens) / Decimal("1000000")) * price_tier["input"]
-        output_cost = (Decimal(usage.completion_tokens) / Decimal("1000000")) * price_tier["output"]
-        
-        base_cost = input_cost + output_cost
-        
-        # Apply Profit Margin
-        total_price_in_usd = base_cost * self.PROFIT_MARGIN
-
-        # Convert USD to Credits
-        total_price_to_user = total_price_in_usd * self.USD_TO_CREDITS_RATE
-        
-        # Round to 6 decimal places to match DB
-        return total_price_to_user.quantize(Decimal("0.000001"))
-
-    def _to_openai_messages(self, prompt: PromptType) -> List[Dict[str, Union[str, list]]]:
-        messages = []
-        
-        # Simple String Prompt
+    @staticmethod
+    def _to_messages(prompt: PromptType) -> list[dict]:
         if isinstance(prompt, str):
             return [{"role": "user", "content": prompt}]
 
-        # List of Messages (ChatMessage objects or dicts)
+        messages: list[dict] = []
         for item in prompt:
             if isinstance(item, ChatMessage):
-                # Use the new helper method that handles attachments/multimodal logic
                 messages.append(item.to_openai_format())
-                
             elif isinstance(item, dict):
-                # Legacy dict support
                 role = "assistant" if item.get("role") == "ai" else item.get("role", "user")
                 messages.append({"role": role, "content": item.get("content", "")})
-                
         return messages
 
     async def generate_stream(
-        self,
-        prompt: PromptType,
-        model: str,
-        usage: Usage
+        self, prompt: PromptType, model: str, usage: Usage
     ) -> AsyncGenerator[str, None]:
-        
-        openai_messages = self._to_openai_messages(prompt)
-        # Fallback logic for model name
-        api_model = model if model in self.pricing else "gpt-5.2-mini"
+        spec = self.spec(model)  # rejects unknown models before any network call
 
         stream = await self.client.chat.completions.create(
-            model=api_model,
-            messages=openai_messages,
+            model=spec.api_model,
+            messages=self._to_messages(prompt),
+            max_completion_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
             stream=True,
-            stream_options={"include_usage": True}
+            stream_options={"include_usage": True},
         )
 
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
-
             if chunk.usage:
-                usage.prompt_tokens = chunk.usage.prompt_tokens
-                usage.completion_tokens = chunk.usage.completion_tokens
+                usage.record(chunk.usage.prompt_tokens, chunk.usage.completion_tokens)
 
-    async def generate_text(
-        self,
-        prompt: PromptType,
-        model: str,
-        usage: Usage
-    ) -> str:
-        openai_messages = self._to_openai_messages(prompt)
-        api_model = model if model in self.pricing else "gpt-5.2-mini"
-        
+    async def generate_text(self, prompt: PromptType, model: str, usage: Usage) -> str:
+        spec = self.spec(model)
+
         response = await self.client.chat.completions.create(
-            model=api_model,
-            messages=openai_messages,
-            stream=False
+            model=spec.api_model,
+            messages=self._to_messages(prompt),
+            max_completion_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
         )
-        
+
         if response.usage:
-            usage.prompt_tokens = response.usage.prompt_tokens
-            usage.completion_tokens = response.usage.completion_tokens
-            
+            usage.record(response.usage.prompt_tokens, response.usage.completion_tokens)
         return response.choices[0].message.content or ""

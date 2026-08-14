@@ -1,8 +1,9 @@
-from uuid import UUID
-from decimal import Decimal
-from typing import Optional
 from datetime import datetime
+from decimal import Decimal
+from uuid import UUID
+
 from pydantic import BaseModel, ConfigDict
+
 
 class TransactionBase(BaseModel):
     amount: Decimal
@@ -10,20 +11,20 @@ class TransactionBase(BaseModel):
     credits_added: Decimal
     status: str
 
-class TransactionCreate(TransactionBase):
-    user_id: UUID
-    package_id: Optional[UUID] = None
-    stripe_session_id: str
 
 class TransactionResponse(TransactionBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     user_id: UUID
-    package_id: Optional[UUID] = None
-    stripe_session_id: str
-    created_at: datetime
-    completed_at: Optional[datetime] = None
+    package_id: UUID | None = None
+    payment_gateway: str | None = None
+    # Exactly one gateway reference is set per transaction, so both are optional.
+    stripe_session_id: str | None = None
+    razorpay_order_id: str | None = None
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
 
-    model_config = ConfigDict(from_attributes=True)
 
 class RazorpayVerification(BaseModel):
     razorpay_order_id: str

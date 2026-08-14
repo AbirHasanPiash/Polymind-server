@@ -1,267 +1,143 @@
-# 🚀 MultiAIModel Backend
+# MultiAIModel Backend
 
-Backend service for **MultiAIModel** — a multi-modal AI platform that integrates multiple AI providers (OpenAI, Gemini, Claude, Google TTS, D-ID) into a unified wallet-based system.
+FastAPI backend for a multi-provider AI platform: streaming chat across OpenAI, Anthropic and
+Gemini, media generation (image, speech, avatar video), and a credit wallet funded through
+Stripe and Razorpay.
 
-Built with **FastAPI**, **PostgreSQL**, **Redis**, and **Celery**, this backend powers real-time AI chat, media generation, payments, and admin analytics.
+## Features
 
----
+- **Streaming chat** over WebSockets, with automatic model routing and per-turn billing
+- **Multi-provider LLMs** behind one interface — models, routing and pricing live in a single registry
+- **Media generation** — OpenAI images, Google Cloud TTS, D-ID avatar video, processed by Celery workers
+- **Credit wallet** with atomic, `Decimal`-exact accounting and automatic refunds on failed jobs
+- **Payments** through Stripe Checkout and Razorpay, idempotent against replayed webhooks
+- **Admin API** for user management, credit adjustments and revenue analytics
+- **JWT auth** with email/password and Google OAuth, plus role-based access control
 
-## 📌 Overview
+## Stack
 
-MultiAIModel Backend provides:
+| Layer | Choice |
+| --- | --- |
+| API | FastAPI, Uvicorn, Pydantic v2 |
+| Data | PostgreSQL, SQLAlchemy 2 (async), Alembic |
+| Cache & queue | Redis, Celery |
+| Storage | Cloudflare R2 (S3-compatible) |
+| Providers | OpenAI, Anthropic, Google Gemini, Google TTS, D-ID |
 
-- 🔐 Secure Authentication (JWT + OAuth2)
-- 💬 Real-time AI Chat (WebSockets + Streaming)
-- 🧠 Multi-LLM Routing (Auto model selection)
-- 🖼 Image Generation (OpenAI)
-- 🔊 Text-to-Speech (Google Cloud)
-- 🎥 AI Avatar Video Generation (D-ID)
-- 💳 Stripe Payment Integration
-- 🏦 Wallet & Credit System
-- 📊 Admin Dashboard APIs
-- ⚡ Background Task Processing (Celery)
-- ☁️ Cloud Storage (Cloudflare R2 / S3 Compatible)
+## Architecture
 
----
-
-# 🏗 Architecture
-
-The backend follows a **Service-Oriented Architecture (SOA)** pattern with clean separation of concerns.
-```bash
+```
 app/
-├── api/ # REST & WebSocket endpoints
-├── core/ # Configuration, DB, Redis, Security
-├── models/ # SQLAlchemy ORM models
-├── schemas/ # Pydantic validation schemas
-├── services/ # Business logic & AI integrations
-├── workers/ # Celery background tasks
-└── main.py # Application entry point
-alembic/ # Database migrations
+├── api/v1/endpoints/   HTTP + WebSocket routes
+├── core/               config, database, redis, security, logging
+├── models/             SQLAlchemy ORM models
+├── schemas/            Pydantic request/response models
+├── services/
+│   ├── llm/            provider adapters, model registry, router
+│   ├── media/          image, speech and video generation
+│   ├── billing.py      wallet debits, credits and refunds
+│   └── storage.py      object storage
+├── workers/            Celery app and background tasks
+└── main.py             application entry point
 ```
 
----
+Requests never mutate a balance in Python. Every credit movement is one conditional SQL
+statement (`UPDATE … WHERE credits >= amount RETURNING credits`), so concurrent requests cannot
+spend the same credits twice. Media endpoints debit before queueing work and the worker refunds
+if the job fails.
 
-# 🛠 Tech Stack
+## Quick start
 
-| Layer | Technology |
-|-------|------------|
-| Framework | FastAPI |
-| Database | PostgreSQL |
-| ORM | SQLAlchemy (Async) |
-| Cache / Broker | Redis |
-| Background Jobs | Celery |
-| Migrations | Alembic |
-| Payments | Stripe |
-| Storage | Cloudflare R2 (S3 Compatible) |
-| AI Providers | OpenAI, Gemini, Claude |
-| TTS | Google Cloud |
-| Avatar Video | D-ID |
-
----
-
-# ⚙️ Environment Setup
-
-## 1️⃣ Clone Repository
+**Requirements:** Python 3.11+, PostgreSQL 14+, Redis 7+
 
 ```bash
-git clone https://github.com/your-username/multiaimodel-backend.git
-cd multiaimodel-backend
-```
-## 2️⃣ Create Virtual Environment
-```bash
-python -m venv venv
-source venv/bin/activate  # Mac/Linux
-venv\Scripts\activate     # Windows
-```
-## 3️⃣ Install Dependencies
-```bash
+git clone <repository-url> && cd ai-platform-backend
+python -m venv venv && source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
-## 4️⃣ Environment Variables
-```bash
-Create a .env file in the root directory:
 
-# App
-PROJECT_NAME="Multi-Model-AI"
-API_V1_STR="/api/v1"
-
-# Security
-SECRET_KEY=""
-ALGORITHM="HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES=60
-
-# Database (Supabase)
-DATABASE_URL="postgresql+asyncpg:<your database url>ssl=require"
-
-# Redis (Local Docker)
-REDIS_URL="redis://localhost:6379/0"
-
-GOOGLE_CLIENT_ID=""
-GOOGLE_CLIENT_SECRET=""
-
-# API keys for AI models
-OPENAI_API_KEY=""
-ANTHROPIC_API_KEY=""
-GOOGLE_API_KEY=""
-DID_API_KEY=""
-
-GOOGLE_APPLICATION_CREDENTIALS=google_credentials.json
-
-# R2 Configuration
-STORAGE_ENDPOINT=
-STORAGE_ACCESS_KEY=
-STORAGE_SECRET_KEY=
-STORAGE_BUCKET_NAME=multimodal-media
-STORAGE_REGION=auto
-# The public URL to access files in the bucket
-STORAGE_PUBLIC_URL=
-
-STRIPE_SECRET_KEY=
-STRIPE_WEBHOOK_SECRET=
-
-FRONTEND_URL="http://localhost:5173"
-```
-## 🗄 Database Setup
-Initialize Migrations
+cp .env.example .env                                 # then fill in the values
 alembic upgrade head
-Create New Migration
-alembic revision --autogenerate -m "Description of change"
-## ▶️ Running the Application
-Start FastAPI Server:
-
 uvicorn app.main:app --reload
+```
 
-Server will run at: http://localhost:8000
-Swagger Documentation: http://localhost:8000/docs
+The API is served at `http://localhost:8000`, interactive docs at `/docs` (disabled when
+`ENVIRONMENT=production`).
 
-## ⚡ Running Background Workers
-Start Redis first.
+Media generation needs a worker as well:
 
-Then run:
+```bash
 celery -A app.workers.celery_app worker --loglevel=info
+```
 
-## 🔐 Authentication Flow
-- JWT-based authentication
-- OAuth2 Bearer tokens
-- Password hashing using secure algorithms
-- WebSocket token verification
-- Role-based access (Admin / User)
+### Configuration
 
-## 💬 Real-Time Chat System
-- WebSocket streaming
-- Context stored temporarily in Redis
-- Persistent chat history in PostgreSQL
-- Atomic billing after completion
-- Multi-provider routing (Auto mode)
+All settings come from the environment and are validated at startup — see
+[`.env.example`](.env.example) for the full list. Required: `SECRET_KEY` (32+ characters),
+`DATABASE_URL` (must use the `postgresql+asyncpg://` driver) and `REDIS_URL`. Provider
+credentials are optional; a missing key disables that one feature and is reported in the
+startup log instead of preventing boot.
 
-## 🧠 Multi-LLM Router
-The system automatically selects the best model based on prompt type:
+### Docker
 
-- Coding -> Claude
-- Large Context ->	Gemini
-- Logical Reasoning ->	GPT
-- Creative Writing ->	Gemini
-## 🖼 Media Generation
-- Image Generation -> OpenAI Image APIs
+```bash
+docker compose up --build                # API, worker and Redis
+docker compose --profile local-db up     # …and a local PostgreSQL
+```
 
-- Uploaded to Cloudflare R2 -> Permanent storage URLs
+## API
 
-- Text-to-Speech -> Google Cloud TTS
+Base path: `/api/v1`
 
-- Audio stored in R2
+| Area | Endpoints |
+| --- | --- |
+| Auth | `POST /auth/signup`, `POST /auth/login`, `POST /auth/google` |
+| Chat | `WS /chat/ws`, `GET /chat/list`, `GET /chat/history/{id}`, `POST /chat/upload`, `DELETE /chat/{id}` |
+| Media | `POST /media/generate`, `/media/generate-image`, `/media/generate-avatar`, `POST /media/tts/{message_id}` |
+| Wallet | `GET /users/me`, `GET /packages/`, `POST /payments/create-checkout-session/{package_id}` |
+| Admin | `GET /admin/stats/overview`, `GET /admin/users`, `PATCH /admin/users/{id}` |
+| Meta | `GET /health`, `GET /health/live`, `GET /api/v1/models` |
 
-- Avatar Video -> D-ID Integration
+`GET /health` reports database and Redis connectivity and returns 503 when either is down;
+`/health/live` is a dependency-free liveness probe.
 
-- Multi-step async workflow
+### Chat WebSocket
 
-- Polling-based completion
+Connect to `/api/v1/chat/ws?token=<jwt>&model=auto&chat_id=<optional>` and send:
 
-- Final video stored in R2
+```json
+{ "type": "user_message", "content": "Explain async/await", "attachments": [] }
+```
 
-## 💳 Stripe Payment Workflow
-User selects package
+The server streams `{"type": "content", "delta": "…"}` and emits `system` events for the chat
+id, the model chosen by the router, and the cost of the turn. Model ids are validated against
+the registry — `GET /api/v1/models` lists what can be requested; `auto` lets the router decide.
 
-Backend creates Stripe Checkout Session
+## Development
 
-Stripe webhook confirms payment
+```bash
+pip install -r requirements-dev.txt
+pytest                      # unit and API tests, no live services needed
+ruff check app tests        # lint
+ruff format app tests       # format
+```
 
-Wallet credits updated atomically
+Database changes:
 
-Transaction stored in database
+```bash
+alembic revision --autogenerate -m "describe the change"
+alembic upgrade head
+```
 
-## 🏦 Wallet & Credits System
-Precise decimal-based accounting
+## Deployment
 
-Atomic transactions
+Pushes to `main` run lint and tests, build the image and publish it to GHCR, then deploy over
+SSH and verify `/health` before finishing (`.github/workflows/deploy.yml`).
+[`render.yaml`](render.yaml) describes an equivalent Render deployment.
 
-Automatic credit deduction
+Before going live: set `ENVIRONMENT=production`, use a strong unique `SECRET_KEY`, restrict
+`CORS_ORIGINS` to your own domains, terminate TLS at the proxy, configure the Stripe webhook
+signing secret, and run `alembic upgrade head` as part of the release.
 
-Profit margin calculation per token
+## License
 
-## 👨‍💼 Admin Features
-Revenue analytics
-
-User management
-
-Package management
-
-Credit adjustments
-
-Usage statistics
-
-## 🧵 Background Task Architecture
-FastAPI → Redis → Celery Worker
-
-Heavy tasks:
-
-Image generation
-
-Video rendering
-
-Media processing
-
-Polling long-running jobs
-
-Ensures:
-
-Non-blocking API
-
-High scalability
-
-Fault tolerance
-
-## 📦 Deployment Notes
-Recommended stack:
-
-Backend: Docker + Render / AWS / DigitalOcean
-
-Database: Managed PostgreSQL
-
-Cache: Managed Redis
-
-Storage: Cloudflare R2
-
-SSL: Reverse Proxy (NGINX or Platform Provided)
-
-# Always configure:
-
-Secure CORS origins
-
-HTTPS only
-
-Proper webhook verification
-
-Strong SECRET_KEY
-
-## 🧪 Health Check
-GET /
-Response:
-
-{
-  "message": "AI Platform Backend Running"
-}
-
-## 📄 License
-This project is proprietary software.
-
-All rights reserved © MultiAIModel.
+Proprietary. All rights reserved © MultiAIModel.

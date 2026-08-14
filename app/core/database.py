@@ -1,102 +1,113 @@
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+"""Async SQLAlchemy engine, session factory and FastAPI dependency."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.pool import NullPool
-from sqlalchemy import text
-from contextlib import asynccontextmanager
-import logging
-import asyncio
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Server-side statement caching and prepared statements must be disabled when
+# talking to a transaction-mode pooler (PgBouncer, Supabase pooler); NullPool is
+# the matching pool strategy because the pooler already owns the connections.
+_connect_args: dict[str, Any] = {
+    "timeout": settings.DB_CONNECT_TIMEOUT,
+    "command_timeout": settings.DB_COMMAND_TIMEOUT,
+    "statement_cache_size": 0,
+    "server_settings": {"application_name": settings.PROJECT_NAME},
+}
+
+_pool_args: dict[str, Any] = (
+    {"poolclass": NullPool}
+    if settings.DB_USE_NULL_POOL
+    else {
+        "pool_size": settings.DB_POOL_SIZE,
+        "max_overflow": settings.DB_MAX_OVERFLOW,
+        "pool_timeout": settings.DB_POOL_TIMEOUT,
+        "pool_recycle": settings.DB_POOL_RECYCLE,
+        "pool_pre_ping": True,
+    }
+)
+
 engine = create_async_engine(
     settings.DATABASE_URL,
-    poolclass=NullPool,
-    connect_args={
-        "timeout": 30,
-        "command_timeout": 60,
-        "server_settings": {
-            "application_name": "fastapi_app"
-        },
-        "statement_cache_size": 0,
-    },
-    echo=False,
+    echo=settings.DB_ECHO,
+    connect_args=_connect_args,
+    **_pool_args,
 )
 
 async_session_maker = async_sessionmaker(
     engine,
     class_=AsyncSession,
     expire_on_commit=False,
-    autocommit=False,
     autoflush=False,
 )
 
 Base = declarative_base()
 
 
-from typing import AsyncGenerator
-
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Dependency for getting database sessions.
-    Handles connection errors gracefully.
-    """
-    session = async_session_maker()
-    try:
-        yield session
-    except Exception as e:
-        logger.error(f"Session error: {e}")
-        await safe_rollback(session)
-        raise
-    finally:
-        await safe_close(session)
-
-
-async def safe_rollback(session: AsyncSession):
-    """Safely rollback a session, ignoring connection errors."""
-    try:
-        await session.rollback()
-    except Exception as e:
-        logger.debug(f"Rollback failed (connection may be closed): {e}")
-
-
-async def safe_close(session: AsyncSession):
-    """Safely close a session, ignoring connection errors."""
-    try:
-        await session.close()
-    except Exception as e:
-        logger.debug(f"Session close failed (connection may be closed): {e}")
-
-
-async def check_db_connection() -> bool:
-    """Verify database connectivity."""
-    try:
-        async with async_session_maker() as session:
-            await session.execute(text("SELECT 1"))
-            return True
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
-        return False
-
-
-async def warmup_db_connection():
-    """Warm up database connection on startup."""
-    for attempt in range(3):
-        if await check_db_connection():
-            logger.info("Database connection established successfully")
-            return True
-        logger.warning(f"Database warmup attempt {attempt + 1} failed, retrying...")
-        await asyncio.sleep(2)
-    logger.warning("Could not establish initial database connection")
-    return False
+    """FastAPI dependency yielding a session that is rolled back on failure."""
+    async with async_session_maker() as session:
+        try:
+            yield session
+        except Exception:
+            await _safe_rollback(session)
+            raise
 
 
 @asynccontextmanager
-async def lifespan(app):
-    """FastAPI lifespan context manager."""
-    logger.info("Starting up application...")
-    await warmup_db_connection()
-    yield
-    logger.info("Shutting down application...")
-    await engine.dispose()
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    """Session for code outside the request cycle (WebSockets, Celery tasks).
+
+    Commits on success, rolls back on failure, always closes.
+    """
+    async with async_session_maker() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await _safe_rollback(session)
+            raise
+
+
+async def _safe_rollback(session: AsyncSession) -> None:
+    """Roll back without masking the original error if the link is already gone."""
+    try:
+        await session.rollback()
+    except Exception as exc:  # pragma: no cover - only on a dead connection
+        logger.debug("Rollback failed (connection likely closed): %s", exc)
+
+
+async def check_db_connection() -> bool:
+    """Return True when the database answers a trivial query."""
+    try:
+        async with async_session_maker() as session:
+            await session.execute(text("SELECT 1"))
+        return True
+    except Exception as exc:
+        logger.warning("Database health check failed: %s", exc)
+        return False
+
+
+async def warmup_db_connection(attempts: int = 3, delay: float = 2.0) -> bool:
+    """Open a connection at startup so the first request isn't the slow one."""
+    for attempt in range(1, attempts + 1):
+        if await check_db_connection():
+            logger.info("Database connection established")
+            return True
+        if attempt < attempts:
+            logger.warning("Database warmup attempt %s/%s failed, retrying…", attempt, attempts)
+            await asyncio.sleep(delay)
+    logger.error("Could not establish a database connection during startup")
+    return False
