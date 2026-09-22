@@ -45,6 +45,20 @@ class TestChatMessage:
     def test_text_property_concatenates_blocks(self):
         assert ChatMessage.from_text("user", "abc").text == "abc"
 
+    def test_responses_input_uses_typed_parts(self):
+        message = ChatMessage.from_text("user", "look")
+        message.attachments = [Attachment(type="image", content="QUJD", mime_type="image/png")]
+        item = message.to_responses_input()
+        assert item["role"] == "user"
+        assert item["content"][0] == {"type": "input_text", "text": "look"}
+        assert item["content"][1]["type"] == "input_image"
+
+    def test_responses_input_for_assistant_is_a_string(self):
+        assert ChatMessage.from_text("ai", "hi").to_responses_input() == {
+            "role": "assistant",
+            "content": "hi",
+        }
+
 
 class TestStorageKeys:
     """Pinned to a known base URL so the result does not depend on local config."""

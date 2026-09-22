@@ -1,14 +1,14 @@
-"""Signup, login and Google OAuth."""
+"""Signup, login, Google OAuth, session refresh and password reset."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import TypeVar
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from sqlalchemy import select
@@ -16,9 +16,25 @@ from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 
 from app.core.config import settings
 from app.core.database import async_session_maker
-from app.core.security import create_access_token, get_password_hash, verify_password
+from app.core.ratelimit import limit_by_ip
+from app.core.security import (
+    consume_password_reset_token,
+    create_access_token,
+    get_current_user,
+    get_password_hash,
+    issue_password_reset_token,
+    verify_password,
+)
 from app.models.user import SIGNUP_BONUS_CREDITS, User, Wallet
-from app.schemas.user import GoogleLogin, Token, UserCreate, UserLogin
+from app.schemas.user import (
+    ForgotPasswordRequest,
+    GoogleLogin,
+    ResetPasswordRequest,
+    Token,
+    UserCreate,
+    UserLogin,
+)
+from app.services.email import password_reset_email, send_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -67,7 +83,10 @@ async def execute_with_retry(
             delay = base_delay * 2 ** (attempt - 1)
             logger.warning(
                 "Database attempt %s/%s failed (%s), retrying in %ss",
-                attempt, max_retries, type(exc).__name__, delay,
+                attempt,
+                max_retries,
+                type(exc).__name__,
+                delay,
             )
             await asyncio.sleep(delay)
     raise AssertionError("unreachable")  # pragma: no cover
@@ -101,6 +120,7 @@ async def create_user_with_wallet(
                 hashed_password=hashed_password,
                 full_name=full_name,
                 is_active=True,
+                last_login_at=datetime.now(UTC),
             )
             user.wallet = Wallet(credits=SIGNUP_BONUS_CREDITS)
             db.add(user)
@@ -118,9 +138,25 @@ async def create_user_with_wallet(
     return await execute_with_retry(operation)
 
 
+async def _mark_login(user_id) -> None:
+    """Best-effort bookkeeping; a failure here must never fail the login."""
+    try:
+        async with async_session_maker() as db:
+            user = await db.get(User, user_id)
+            if user is not None:
+                user.last_login_at = datetime.now(UTC)
+                await db.commit()
+    except Exception as exc:  # pragma: no cover - only on a flaky connection
+        logger.debug("Could not record last login: %s", exc)
+
+
 # Note: 201 would be the more correct status for a create, but existing clients
 # check for 200, so the status is kept as-is.
-@router.post("/signup", response_model=Token)
+@router.post(
+    "/signup",
+    response_model=Token,
+    dependencies=[Depends(limit_by_ip("signup", settings.RATE_LIMIT_SIGNUP_PER_HOUR, 3600))],
+)
 async def signup(user_in: UserCreate) -> Token:
     """Register with email and password."""
     if await get_user_by_email(user_in.email):
@@ -138,7 +174,11 @@ async def signup(user_in: UserCreate) -> Token:
     return _token_response(user.email)
 
 
-@router.post("/login", response_model=Token)
+@router.post(
+    "/login",
+    response_model=Token,
+    dependencies=[Depends(limit_by_ip("login", settings.RATE_LIMIT_LOGIN_PER_MINUTE, 60))],
+)
 async def login(user_in: UserLogin) -> Token:
     """Exchange email and password for an access token."""
     user = await get_user_by_email(user_in.email)
@@ -154,10 +194,15 @@ async def login(user_in: UserLogin) -> Token:
             detail="This account has been deactivated",
         )
 
+    await _mark_login(user.id)
     return _token_response(user.email)
 
 
-@router.post("/google", response_model=Token)
+@router.post(
+    "/google",
+    response_model=Token,
+    dependencies=[Depends(limit_by_ip("google", settings.RATE_LIMIT_LOGIN_PER_MINUTE * 2, 60))],
+)
 async def google_login(login_data: GoogleLogin) -> Token:
     """Log in (or register) with a Google ID token."""
     if not settings.google_login_enabled:
@@ -193,9 +238,9 @@ async def google_login(login_data: GoogleLogin) -> Token:
         logger.info("Registering new user from Google login: %s", email)
         user = await create_user_with_wallet(
             email=email,
-            # A random password keeps the account unusable via the password form
-            # until the user deliberately sets one.
-            hashed_password=get_password_hash(secrets.token_urlsafe(32)),
+            # No password: the account signs in with Google until the user sets
+            # one through the reset flow. A null hash can never verify.
+            hashed_password=None,
             full_name=id_info.get("name") or "Google User",
         )
     elif not user.is_active:
@@ -203,5 +248,66 @@ async def google_login(login_data: GoogleLogin) -> Token:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This account has been deactivated",
         )
+    else:
+        await _mark_login(user.id)
 
+    return _token_response(user.email)
+
+
+@router.post("/refresh", response_model=Token)
+async def refresh(current_user: User = Depends(get_current_user)) -> Token:
+    """Issue a fresh token for a still-valid session.
+
+    The client calls this while the app is in use, so an active user is never
+    logged out mid-conversation by the hard expiry.
+    """
+    return _token_response(current_user.email)
+
+
+@router.post(
+    "/forgot-password",
+    dependencies=[Depends(limit_by_ip("forgot-password", 5, 900))],
+)
+async def forgot_password(payload: ForgotPasswordRequest) -> dict:
+    """Email a single-use reset link. Always answers the same way, so the
+    endpoint cannot be used to check whether an address is registered."""
+    user = await get_user_by_email(payload.email)
+    if user is not None and user.is_active:
+        token = await issue_password_reset_token(user.id)
+        reset_url = f"{settings.FRONTEND_URL.rstrip('/')}/reset-password?token={token}"
+        subject, text, html = password_reset_email(reset_url)
+        delivered = await send_email(user.email, subject, text, html)
+        if not delivered and not settings.is_production:
+            logger.warning("DEV password reset link for %s: %s", user.email, reset_url)
+    return {"message": "If that email is registered, a reset link is on its way."}
+
+
+@router.post("/reset-password", response_model=Token)
+async def reset_password(payload: ResetPasswordRequest) -> Token:
+    """Set a new password from a reset token and sign the user in."""
+    user_id = await consume_password_reset_token(payload.token)
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This reset link is invalid or has expired",
+        )
+
+    async def operation() -> User | None:
+        async with async_session_maker() as db:
+            user = await db.get(User, user_id)
+            if user is None or not user.is_active:
+                return None
+            user.hashed_password = get_password_hash(payload.new_password)
+            user.last_login_at = datetime.now(UTC)
+            await db.commit()
+            await db.refresh(user)
+            return user
+
+    user = await execute_with_retry(operation)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="This account is not available"
+        )
+
+    logger.info("Password reset completed for %s", user.email)
     return _token_response(user.email)

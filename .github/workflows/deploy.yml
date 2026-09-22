@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: abirhasanpiash/multimodal-ai-platform
+  IMAGE_NAME: abirhasanpiash/polymind-server
 
 jobs:
   # Lint and test gate: nothing is built or deployed unless this passes.
@@ -90,12 +90,12 @@ jobs:
             set -euo pipefail
 
             echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker pull ghcr.io/abirhasanpiash/multimodal-ai-platform:latest
+            docker pull ghcr.io/abirhasanpiash/polymind-server:latest
 
             cat <<'EOF' > docker-compose.yml
             services:
               web:
-                image: ghcr.io/abirhasanpiash/multimodal-ai-platform:latest
+                image: ghcr.io/abirhasanpiash/polymind-server:latest
                 container_name: fastapi_web
                 restart: always
                 command: uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -109,7 +109,7 @@ jobs:
                     condition: service_healthy
 
               worker:
-                image: ghcr.io/abirhasanpiash/multimodal-ai-platform:latest
+                image: ghcr.io/abirhasanpiash/polymind-server:latest
                 container_name: fastapi_worker
                 restart: always
                 command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2

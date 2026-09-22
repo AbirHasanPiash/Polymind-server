@@ -56,9 +56,17 @@ def configure_logging() -> None:
             },
             "root": {"handlers": ["default"], "level": settings.LOG_LEVEL},
             "loggers": {
-                "uvicorn": {"handlers": ["default"], "level": settings.LOG_LEVEL, "propagate": False},
+                "uvicorn": {
+                    "handlers": ["default"],
+                    "level": settings.LOG_LEVEL,
+                    "propagate": False,
+                },
                 "uvicorn.access": {"handlers": ["default"], "level": "WARNING", "propagate": False},
-                "uvicorn.error": {"handlers": ["default"], "level": settings.LOG_LEVEL, "propagate": False},
+                "uvicorn.error": {
+                    "handlers": ["default"],
+                    "level": settings.LOG_LEVEL,
+                    "propagate": False,
+                },
                 "sqlalchemy.engine": {"level": "WARNING"},
                 **{name: {"level": "WARNING"} for name in _NOISY_LOGGERS},
             },

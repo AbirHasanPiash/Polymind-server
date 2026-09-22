@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, ForeignKey, Numeric, String, text
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -17,10 +17,17 @@ class User(Base):
     full_name = Column(String, nullable=True)
     is_active = Column(Boolean, default=True, server_default=text("true"), nullable=False)
     is_superuser = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    # Free-form, validated by the API layer: default model, custom instructions,
+    # saved prompts, UI preferences. Kept as one document so adding a setting
+    # is not a migration.
+    preferences = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
     created_at = created_at_column()
     updated_at = updated_at_column()
 
-    wallet = relationship("Wallet", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    wallet = relationship(
+        "Wallet", back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
     chats = relationship("Chat", back_populates="user", cascade="all, delete-orphan")
     audios = relationship("GeneratedAudio", back_populates="user", cascade="all, delete-orphan")
     images = relationship("GeneratedImage", back_populates="user", cascade="all, delete-orphan")

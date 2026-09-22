@@ -12,9 +12,9 @@ import io
 import logging
 from pathlib import Path
 
-import PyPDF2
 from fastapi import HTTPException, UploadFile, status
 from PIL import Image, UnidentifiedImageError
+from pypdf import PdfReader
 
 from app.core.config import settings
 
@@ -32,10 +32,38 @@ MAX_IMAGE_DIMENSION = 2048  # longest edge after downscaling
 Image.MAX_IMAGE_PIXELS = 50_000_000
 
 CODE_EXTENSIONS = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".c", ".cpp", ".h", ".hpp",
-    ".java", ".rs", ".go", ".rb", ".php", ".sh", ".bat", ".ps1",
-    ".html", ".css", ".scss", ".sql", ".json", ".yaml", ".yml",
-    ".xml", ".md", ".txt", ".env", ".gitignore", ".dockerfile", ".conf", ".ini",
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".java",
+    ".rs",
+    ".go",
+    ".rb",
+    ".php",
+    ".sh",
+    ".bat",
+    ".ps1",
+    ".html",
+    ".css",
+    ".scss",
+    ".sql",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".md",
+    ".txt",
+    ".env",
+    ".gitignore",
+    ".dockerfile",
+    ".conf",
+    ".ini",
 }
 
 IMAGE_FORMATS = {
@@ -65,7 +93,7 @@ async def process_file(file: UploadFile) -> dict:
         raise _bad_request(f"{filename} is empty")
     if len(file_bytes) > settings.max_upload_size_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"{filename} exceeds the {settings.MAX_UPLOAD_SIZE_MB} MB limit",
         )
 
@@ -134,7 +162,7 @@ def _process_image(file_bytes: bytes, mime_type: str) -> dict:
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
     try:
-        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        reader = PdfReader(io.BytesIO(file_bytes))
         pages = (page.extract_text() for page in reader.pages[:MAX_PDF_PAGES])
         text = "\n".join(page for page in pages if page)
     except Exception as exc:

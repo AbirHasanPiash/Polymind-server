@@ -26,8 +26,8 @@ from app.models.media import (
     GeneratedVideo,
 )
 from app.services import billing
-from app.services.media.image_openai import image_service
-from app.services.media.tts_google import tts_service
+from app.services.media.images import image_service
+from app.services.media.tts import tts_service
 from app.services.media.video_did import DIDError, did_service
 from app.services.storage import storage
 from app.workers.celery_app import celery_app, run_async
@@ -68,11 +68,14 @@ def generate_tts_task(
     user_id: str,
     cost: float,
     voice_name: str = "en-US-Neural2-F",
+    instructions: str | None = None,
 ) -> dict:
     """Synthesize speech, store it, and record the result."""
 
     async def _process() -> dict:
-        public_url = await tts_service.generate_audio(text, voice_name=voice_name)
+        public_url = await tts_service.generate_audio(
+            text, voice_name=voice_name, instructions=instructions
+        )
         storage_path = storage.key_from_url(public_url) or public_url
 
         async with session_scope() as db:
@@ -83,7 +86,7 @@ def generate_tts_task(
                     public_url=public_url,
                     text_prompt=text[:500],
                     source_message_id=uuid.UUID(message_id) if message_id else None,
-                    provider="google",
+                    provider="openai" if voice_name.startswith("openai/") else "google",
                     voice_name=voice_name,
                     cost=Decimal(str(cost)),
                 )

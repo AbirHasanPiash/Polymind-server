@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -16,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.redis import get_redis_client
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -122,3 +125,38 @@ async def verify_token_socket(token: str, db: AsyncSession) -> User | None:
     if payload is None:
         return None
     return await _load_active_user(payload["sub"], db)
+
+
+# ── password reset tokens ─────────────────────────────────────────────────
+#
+# Single-use, short-lived, stored hashed in Redis: a leaked database dump or a
+# log line cannot be replayed into a reset.
+
+
+def _reset_key(token: str) -> str:
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    return f"password-reset:{digest}"
+
+
+async def issue_password_reset_token(user_id: uuid.UUID) -> str:
+    token = secrets.token_urlsafe(32)
+    await get_redis_client().setex(
+        _reset_key(token), settings.PASSWORD_RESET_TOKEN_MINUTES * 60, str(user_id)
+    )
+    return token
+
+
+async def consume_password_reset_token(token: str) -> uuid.UUID | None:
+    """Return the user id for a valid token and invalidate it, or None."""
+    redis = get_redis_client()
+    key = _reset_key(token)
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.get(key)
+        pipe.delete(key)
+        value, _ = await pipe.execute()
+    if not value:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except ValueError:
+        return None

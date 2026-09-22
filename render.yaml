@@ -1,7 +1,7 @@
 services:
   # FastAPI web service
   - type: web
-    name: multi-model-ai
+    name: polymind-server
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -16,7 +16,7 @@ services:
       - key: REDIS_URL
         fromService:
           type: redis
-          name: fastapi-redis
+          name: polymind-redis
           property: connectionString
       # Secrets are set in the Render dashboard, never committed here.
       - key: SECRET_KEY
@@ -57,7 +57,7 @@ services:
         sync: false
 
   - type: redis
-    name: fastapi-redis
+    name: polymind-redis
     plan: free
     maxmemoryPolicy: allkeys-lru
     ipAllowList: []
@@ -67,7 +67,7 @@ services:
 # copy the env vars above to enable it:
 #
 #  - type: worker
-#    name: multi-model-ai-worker
+#    name: polymind-worker
 #    runtime: python
 #    plan: starter
 #    buildCommand: pip install -r requirements.txt

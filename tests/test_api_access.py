@@ -19,9 +19,17 @@ ADMIN_ROUTES = [
 USER_ROUTES = [
     ("GET", "/api/v1/users/me"),
     ("PATCH", "/api/v1/users/me"),
+    ("POST", "/api/v1/users/me/password"),
+    ("DELETE", "/api/v1/users/me"),
+    ("GET", "/api/v1/users/me/usage"),
     ("POST", "/api/v1/users/topup?amount=100"),
+    ("POST", "/api/v1/auth/refresh"),
     ("GET", "/api/v1/chat/list"),
+    ("GET", "/api/v1/chat/search?q=hello"),
+    ("GET", "/api/v1/chat/00000000-0000-4000-8000-000000000000/export"),
+    ("POST", "/api/v1/chat/00000000-0000-4000-8000-000000000000/share"),
     ("GET", "/api/v1/media/list"),
+    ("POST", "/api/v1/media/generate"),
     ("GET", "/api/v1/packages/"),
     ("GET", "/api/v1/payments/history"),
 ]
@@ -52,9 +60,27 @@ class TestPublicEndpoints:
         assert client.get("/").json()["status"] == "running"
 
     def test_model_catalogue_is_public(self, client: TestClient):
-        models = client.get("/api/v1/models").json()["models"]
+        payload = client.get("/api/v1/models").json()
+        models = payload["models"]
         assert models
-        assert {"id", "provider", "description"} <= set(models[0])
+        assert {"id", "provider", "display_name", "description", "tier", "pricing"} <= set(
+            models[0]
+        )
+        assert payload["routing"]["default"] in {m["id"] for m in models}
+        assert payload["default_effort"] in payload["effort_levels"]
+
+    def test_feature_flags_are_public(self, client: TestClient):
+        assert "features" in client.get("/api/v1/features").json()
+
+    def test_voice_and_image_catalogues_are_public(self, client: TestClient):
+        assert client.get("/api/v1/media/voices").json()["voices"]
+        assert client.get("/api/v1/media/images/options").json()["models"]
+
+    def test_security_headers_are_set(self, client: TestClient):
+        response = client.get("/health/live")
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert response.headers["X-Request-ID"]
 
 
 class TestInputValidation:

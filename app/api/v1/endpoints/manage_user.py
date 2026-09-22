@@ -99,7 +99,10 @@ async def update_user_admin(
     await db.refresh(user, attribute_names=["wallet"])
 
     logger.info(
-        "Admin %s updated user %s (%s)", admin.email, user.email, ", ".join(update_data) or "credits"
+        "Admin %s updated user %s (%s)",
+        admin.email,
+        user.email,
+        ", ".join(update_data) or "credits",
     )
     return user
 

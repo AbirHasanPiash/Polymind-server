@@ -3,14 +3,17 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.media.tts_google import DEFAULT_VOICE, MAX_TTS_CHARS
+from app.services.media.tts import DEFAULT_VOICE, MAX_TTS_CHARS
 
 MAX_PROMPT_LENGTH = 4000
+MAX_TTS_INSTRUCTIONS = 300
 
 
 class AudioGenerationRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TTS_CHARS)
     voice_name: str = DEFAULT_VOICE
+    # Delivery hints for steerable voices ("cheerful", "slow and calm").
+    instructions: str | None = Field(None, max_length=MAX_TTS_INSTRUCTIONS)
 
 
 class GeneratedAudioResponse(BaseModel):
@@ -21,13 +24,14 @@ class GeneratedAudioResponse(BaseModel):
     text_prompt: str
     voice_name: str | None = None
     provider: str
+    source_message_id: UUID | None = None
     cost: float  # display value; the ledger keeps full Decimal precision
     created_at: datetime | None = None
 
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=MAX_PROMPT_LENGTH)
-    model: str = "gpt-image-1.5"
+    model: str = "gpt-image-2"
     size: str = "1024x1024"
     quality: str = "medium"
     reference_image_url: str | None = None
@@ -61,8 +65,6 @@ class GeneratedVideoResponse(BaseModel):
     public_url: str | None = None
     thumbnail_url: str | None = None
     status: str
-    # Mapped from the model's ``script_text`` column, which the previous field
-    # name did not match — the response always came back empty.
     script_text: str
     avatar_image_url: str
     error_message: str | None = None

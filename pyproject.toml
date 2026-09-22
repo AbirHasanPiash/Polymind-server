@@ -1,5 +1,5 @@
 [project]
-name = "ai-platform-backend"
+name = "polymind-server"
 version = "1.0.0"
 description = "Multi-provider AI platform backend: streaming chat, media generation, wallet billing"
 requires-python = ">=3.11"

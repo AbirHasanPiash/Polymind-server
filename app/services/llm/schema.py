@@ -45,20 +45,26 @@ class ChatMessage(BaseModel):
         """Concatenated text of every content block (empty string if none)."""
         return "".join(block.text for block in self.content)
 
+    @property
+    def is_assistant(self) -> bool:
+        return self.role in ("ai", "assistant")
+
+    def _text_with_attachments(self) -> str:
+        """Prompt text with any text attachments folded in after it."""
+        text_attachments = [a.content for a in self.attachments if a.type == "text"]
+        return "\n\n".join(filter(None, [self.text, *text_attachments]))
+
     def to_openai_format(self) -> dict[str, object]:
-        """Convert to the OpenAI chat format, mapping 'ai' to 'assistant'."""
+        """Chat Completions shape, kept for tests and any compatible provider."""
         role = "assistant" if self.role == "ai" else self.role
 
         if not self.attachments:
             return {"role": role, "content": self.text}
 
-        # With attachments the API requires the multipart "content parts" form.
         parts: list[dict[str, object]] = []
-        text_content = self.text
-
-        text_attachments = [a.content for a in self.attachments if a.type == "text"]
-        if text_content or text_attachments:
-            parts.append({"type": "text", "text": "\n\n".join(filter(None, [text_content, *text_attachments]))})
+        combined = self._text_with_attachments()
+        if combined:
+            parts.append({"type": "text", "text": combined})
 
         for attachment in self.attachments:
             if attachment.type == "image":
@@ -72,4 +78,32 @@ class ChatMessage(BaseModel):
                     }
                 )
 
+        return {"role": role, "content": parts}
+
+    def to_responses_input(self) -> dict[str, object]:
+        """OpenAI Responses API input item.
+
+        Assistant turns are plain strings; user turns become typed parts so
+        images travel as ``input_image`` data URLs.
+        """
+        if self.is_assistant:
+            return {"role": "assistant", "content": self._text_with_attachments()}
+
+        role = "user" if self.role != "system" else "system"
+        if not self.attachments:
+            return {"role": role, "content": self.text}
+
+        parts: list[dict[str, object]] = []
+        combined = self._text_with_attachments()
+        if combined:
+            parts.append({"type": "input_text", "text": combined})
+        for attachment in self.attachments:
+            if attachment.type == "image":
+                parts.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{attachment.mime_type or 'image/jpeg'};base64,{attachment.content}",
+                        "detail": "auto",
+                    }
+                )
         return {"role": role, "content": parts}

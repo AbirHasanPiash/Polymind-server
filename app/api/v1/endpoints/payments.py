@@ -164,10 +164,14 @@ async def stripe_webhook(
             payload, stripe_signature, settings.STRIPE_WEBHOOK_SECRET
         )
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid payload") from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid payload"
+        ) from exc
     except stripe.SignatureVerificationError as exc:
         logger.warning("Rejected Stripe webhook with an invalid signature")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature") from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature"
+        ) from exc
 
     if event["type"] == "checkout.session.completed":
         await _handle_checkout_completed(event["data"]["object"], db)
@@ -183,7 +187,9 @@ async def _handle_checkout_completed(session: dict, db: AsyncSession) -> None:
 
     # "completed" also fires for asynchronous methods that have not settled yet.
     if session.get("payment_status") != "paid":
-        logger.info("Checkout %s completed but not paid (%s)", session_id, session.get("payment_status"))
+        logger.info(
+            "Checkout %s completed but not paid (%s)", session_id, session.get("payment_status")
+        )
         return
 
     transaction = await _lock_or_create_stripe_transaction(session, db)
@@ -197,13 +203,13 @@ async def _handle_checkout_completed(session: dict, db: AsyncSession) -> None:
 
     logger.info(
         "Credited %s credits to user %s for Stripe session %s",
-        transaction.credits_added, transaction.user_id, session_id,
+        transaction.credits_added,
+        transaction.user_id,
+        session_id,
     )
 
 
-async def _lock_or_create_stripe_transaction(
-    session: dict, db: AsyncSession
-) -> Transaction | None:
+async def _lock_or_create_stripe_transaction(session: dict, db: AsyncSession) -> Transaction | None:
     """Return the locked transaction for a session, creating it if it is missing.
 
     The row is normally written when checkout starts. It can be absent if that
@@ -346,9 +352,12 @@ async def verify_razorpay_payment(
     if transaction.user_id != current_user.id:
         logger.warning(
             "User %s tried to verify a payment belonging to %s",
-            current_user.email, transaction.user_id,
+            current_user.email,
+            transaction.user_id,
         )
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Order does not belong to you")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Order does not belong to you"
+        )
 
     if transaction.status == STATUS_COMPLETED:
         return {"status": "success", "message": "Payment already processed"}
@@ -371,7 +380,9 @@ async def verify_razorpay_payment(
 
     logger.info(
         "Credited %s credits to user %s for Razorpay order %s",
-        transaction.credits_added, transaction.user_id, transaction.razorpay_order_id,
+        transaction.credits_added,
+        transaction.user_id,
+        transaction.razorpay_order_id,
     )
     return {"status": "success", "message": "Payment verified and credits added"}
 

@@ -10,11 +10,12 @@ Third-party credentials are optional: a missing key disables that one feature
 
 from __future__ import annotations
 
+import json
 from functools import cached_property
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, computed_field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 Environment = Literal["development", "staging", "production"]
 
@@ -28,21 +29,25 @@ class Settings(BaseSettings):
     )
 
     # Application
-    PROJECT_NAME: str = "AI Platform"
+    PROJECT_NAME: str = "Polymind"
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: Environment = "development"
     LOG_LEVEL: str = "INFO"
-    FRONTEND_URL: str = "http://localhost:3000"
+    FRONTEND_URL: str = "http://localhost:5173"
 
     # Security
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=60, gt=0)
-    CORS_ORIGINS: list[str] = Field(
+    # Sessions are refreshed by the client while it is in use (POST /auth/refresh),
+    # so the hard expiry can stay reasonably short.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=240, gt=0)
+    PASSWORD_RESET_TOKEN_MINUTES: int = Field(default=30, gt=0)
+    # NoDecode: pydantic-settings would otherwise JSON-decode the variable before
+    # the validator below can accept the comma-separated form.
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
         default=[
-            "https://multiaimodel.com",
-            "https://www.multiaimodel.com",
-            "https://multimodal-ai-five.vercel.app",
+            "https://polymindai.com",
+            "https://www.polymindai.com",
             "http://localhost:3000",
             "http://localhost:5173",
             "http://localhost:8000",
@@ -66,8 +71,9 @@ class Settings(BaseSettings):
     CACHE_TTL_SECONDS: int = Field(default=3600, gt=0)
 
     # Chat
-    CHAT_HISTORY_LIMIT: int = Field(default=10, ge=1, le=100)
-    CHAT_STREAM_TIMEOUT_SECONDS: int = Field(default=120, gt=0)
+    CHAT_HISTORY_LIMIT: int = Field(default=24, ge=1, le=200)
+    CHAT_STREAM_TIMEOUT_SECONDS: int = Field(default=300, gt=0)
+    CHAT_TITLE_GENERATION: bool = True
     MAX_UPLOAD_SIZE_MB: int = Field(default=10, gt=0)
     MAX_UPLOAD_FILES: int = Field(default=5, gt=0)
 
@@ -95,9 +101,24 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: str | None = None
     RAZORPAY_KEY_SECRET: str | None = None
 
+    # Email (password resets). Optional: without SMTP the message is logged.
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str | None = None
+    SMTP_PASSWORD: str | None = None
+    SMTP_USE_TLS: bool = True
+    SMTP_USE_SSL: bool = False
+    EMAIL_FROM: str = "Polymind <no-reply@localhost>"
+
     # Media generation
     DID_POLL_INTERVAL_SECONDS: int = Field(default=5, gt=0)
     DID_POLL_MAX_ATTEMPTS: int = Field(default=100, gt=0)
+
+    # Abuse protection (per window)
+    RATE_LIMIT_LOGIN_PER_MINUTE: int = Field(default=10, ge=1)
+    RATE_LIMIT_SIGNUP_PER_HOUR: int = Field(default=20, ge=1)
+    RATE_LIMIT_MEDIA_PER_HOUR: int = Field(default=60, ge=1)
+    RATE_LIMIT_UPLOADS_PER_HOUR: int = Field(default=120, ge=1)
 
     # Development helpers — must stay off in production (see validator below)
     ALLOW_DEV_TOPUP: bool = False
@@ -133,9 +154,12 @@ class Settings(BaseSettings):
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def _split_cors_origins(cls, value: object) -> object:
-        # Accept both a JSON array and a comma-separated string in the environment.
-        if isinstance(value, str) and not value.strip().startswith("["):
-            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        """Accept a JSON array or a comma-separated string in the environment."""
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [origin.strip().rstrip("/") for origin in text.split(",") if origin.strip()]
         return value
 
     @computed_field  # type: ignore[prop-decorator]
@@ -168,6 +192,10 @@ class Settings(BaseSettings):
         return bool(self.GOOGLE_CLIENT_ID)
 
     @cached_property
+    def email_enabled(self) -> bool:
+        return bool(self.SMTP_HOST)
+
+    @cached_property
     def max_upload_size_bytes(self) -> int:
         return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
@@ -182,8 +210,23 @@ class Settings(BaseSettings):
             "Object storage (STORAGE_*)": self.storage_enabled,
             "Stripe payments (STRIPE_*)": self.stripe_enabled,
             "Razorpay payments (RAZORPAY_*)": self.razorpay_enabled,
+            "Email delivery (SMTP_*)": self.email_enabled,
         }
         return [name for name, enabled in checks.items() if not enabled]
+
+    def public_features(self) -> dict[str, bool]:
+        """Feature flags the client uses to hide what is not configured."""
+        return {
+            "google_login": self.google_login_enabled,
+            "openai": bool(self.OPENAI_API_KEY),
+            "anthropic": bool(self.ANTHROPIC_API_KEY),
+            "google": bool(self.GOOGLE_API_KEY),
+            "avatar_video": bool(self.DID_API_KEY),
+            "storage": self.storage_enabled,
+            "stripe": self.stripe_enabled,
+            "razorpay": self.razorpay_enabled,
+            "password_reset": True,
+        }
 
     def model_post_init(self, __context: object) -> None:
         if self.is_production and self.ALLOW_DEV_TOPUP:

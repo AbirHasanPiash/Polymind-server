@@ -46,7 +46,7 @@ class GeneratedImage(Base):
     reference_image_url = Column(String, nullable=True)
     revised_prompt = Column(Text, nullable=True)
 
-    model = Column(String, default="gpt-image-1.5")
+    model = Column(String, default="gpt-image-2")
     size = Column(String, default="1024x1024")
     quality = Column(String, default="standard")
     cost = Column(Numeric(18, 6), nullable=False, default=0)

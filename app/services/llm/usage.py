@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Rough industry average for English text; only used when a provider omits usage.
 CHARS_PER_TOKEN = 4
@@ -20,7 +20,9 @@ class Usage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def record(self, prompt_tokens: int | None = None, completion_tokens: int | None = None) -> None:
+    def record(
+        self, prompt_tokens: int | None = None, completion_tokens: int | None = None
+    ) -> None:
         """Store counts reported by a provider, ignoring the Nones some SDKs send.
 
         Streaming APIs report usage in a late chunk and may send ``None`` in the
@@ -42,3 +44,23 @@ class Usage:
             self.prompt_tokens = math.ceil(len(prompt_text) / CHARS_PER_TOKEN)
         if self.completion_tokens <= 0 and completion_text:
             self.completion_tokens = math.ceil(len(completion_text) / CHARS_PER_TOKEN)
+
+
+def estimate_tokens(text: str) -> int:
+    """Cheap upper-ish estimate used for pre-flight affordability checks."""
+    return math.ceil(len(text or "") / CHARS_PER_TOKEN)
+
+
+@dataclass(slots=True)
+class Outcome:
+    """What happened to a generation, beyond the text it produced.
+
+    Filled in by the adapter as the stream completes: which model actually
+    served the request (a provider-side fallback may differ from the one asked
+    for), why it stopped, and any note worth surfacing to the user.
+    """
+
+    served_model: str | None = None
+    finish_reason: str = "stop"  # stop | length | refusal | interrupted | error
+    refusal_category: str | None = None
+    notes: list[str] = field(default_factory=list)

@@ -41,14 +41,14 @@ services:
     restart: unless-stopped
 
   # Optional local database: `docker compose --profile local-db up`.
-  # Point DATABASE_URL at postgresql+asyncpg://postgres:postgres@postgres:5432/ai_platform
+  # Point DATABASE_URL at postgresql+asyncpg://postgres:postgres@postgres:5432/polymind
   postgres:
     profiles: ["local-db"]
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ai_platform
+      POSTGRES_DB: polymind
     ports:
       - "5432:5432"
     volumes:

@@ -30,16 +30,24 @@ from app.core.logging import configure_logging
 from app.core.redis import check_redis_connection, close_redis
 from app.services.llm.base import ProviderNotConfiguredError
 from app.services.llm.factory import LLMFactory
-from app.services.llm.models import UnknownModelError
+from app.services.llm.models import (
+    DEFAULT_EFFORT,
+    EFFORT_LEVELS,
+    PROVIDER_LABELS,
+    ROUTING_DEFAULTS,
+    UnknownModelError,
+)
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+APP_VERSION = "2.0.0"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Warm the database on boot and release resources on shutdown."""
-    logger.info("Starting %s (%s)", settings.PROJECT_NAME, settings.ENVIRONMENT)
+    logger.info("Starting %s %s (%s)", settings.PROJECT_NAME, APP_VERSION, settings.ENVIRONMENT)
 
     disabled = settings.disabled_features()
     if disabled:
@@ -55,7 +63,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.0.0",
+    version=APP_VERSION,
+    description="Multi-model AI workspace: streaming chat, media studios and a credit wallet.",
     lifespan=lifespan,
     # Interactive docs are useful in development and an attack surface map in
     # production, where the schema is served to authenticated tooling only.
@@ -69,15 +78,23 @@ app.add_middleware(
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "Content-Disposition"],
     max_age=600,
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
-    """Tag every request with an id and log how long it took."""
+    """Tag every request with an id, add security headers and log the timing."""
     request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
     request.state.request_id = request_id
 
@@ -86,10 +103,21 @@ async def request_context(request: Request, call_next):
     duration_ms = (time.perf_counter() - started) * 1000
 
     response.headers["X-Request-ID"] = request_id
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    if settings.is_production:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+        )
+
     log = logger.warning if duration_ms > 3000 else logger.info
     log(
         "%s %s -> %s in %.0fms [%s]",
-        request.method, request.url.path, response.status_code, duration_ms, request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+        request_id,
     )
     return response
 
@@ -103,7 +131,9 @@ async def unknown_model_handler(_: Request, exc: UnknownModelError) -> JSONRespo
 
 
 @app.exception_handler(ProviderNotConfiguredError)
-async def provider_not_configured_handler(_: Request, exc: ProviderNotConfiguredError) -> JSONResponse:
+async def provider_not_configured_handler(
+    _: Request, exc: ProviderNotConfiguredError
+) -> JSONResponse:
     logger.error("Provider unavailable: %s", exc)
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -147,6 +177,7 @@ app.include_router(manage_user.router, prefix=f"{api}/admin/users", tags=["admin
 async def read_root() -> dict:
     return {
         "service": settings.PROJECT_NAME,
+        "version": APP_VERSION,
         "status": "running",
         "docs": None if settings.is_production else "/docs",
     }
@@ -163,6 +194,7 @@ async def health() -> JSONResponse:
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
         content={
             "status": "healthy" if healthy else "degraded",
+            "version": APP_VERSION,
             "database": "connected" if db_ok else "disconnected",
             "redis": "connected" if redis_ok else "disconnected",
         },
@@ -175,12 +207,28 @@ async def liveness() -> dict:
     return {"status": "alive"}
 
 
-@app.get(f"{settings.API_V1_STR}/models", tags=["chat"])
+@app.get(f"{api}/models", tags=["chat"])
 async def list_models() -> dict:
-    """Models the client may request, with their descriptions."""
+    """The model catalogue the client may request, with routing defaults.
+
+    Every field the picker shows comes from here, so the UI can never offer a
+    model the backend would reject or quote a price the biller disagrees with.
+    """
+    features = settings.public_features()
+    providers = [
+        {"id": provider, "label": label, "enabled": bool(features.get(provider, True))}
+        for provider, label in PROVIDER_LABELS.items()
+    ]
     return {
-        "models": [
-            {"id": spec.id, "provider": spec.provider, "description": spec.description}
-            for spec in LLMFactory.get_all_models()
-        ]
+        "models": [spec.to_public() for spec in LLMFactory.get_all_models()],
+        "providers": providers,
+        "routing": ROUTING_DEFAULTS,
+        "effort_levels": list(EFFORT_LEVELS),
+        "default_effort": DEFAULT_EFFORT,
     }
+
+
+@app.get(f"{api}/features", tags=["meta"])
+async def list_features() -> dict:
+    """Which optional integrations are configured, so the client can hide the rest."""
+    return {"features": settings.public_features(), "signup_bonus_credits": 10}

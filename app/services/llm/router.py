@@ -1,16 +1,18 @@
 """Intent-based model selection for "auto" mode.
 
-The prompt is scored against four keyword families; the highest-scoring family
-picks the model best suited to it. An explicit user preference always wins, but
-it is validated against the model registry first.
+The prompt is scored against keyword families; the highest-scoring family picks
+the model best suited to it. An explicit user preference always wins, but it is
+validated against the model registry first.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from app.services.llm.models import (
     DEFAULT_CODING_MODEL,
+    DEFAULT_CREATIVE_MODEL,
     DEFAULT_FAST_MODEL,
     DEFAULT_LONG_CONTEXT_MODEL,
     DEFAULT_MODEL,
@@ -24,6 +26,27 @@ AUTO = "auto"
 LONG_PROMPT_CHARS = 4000
 # Prompts shorter than this go to the fastest model when no intent is detected.
 SHORT_PROMPT_CHARS = 150
+
+INTENT_LABELS: dict[str, str] = {
+    "coding": "Code detected — routed to the strongest coding model",
+    "long_context": "Large input — routed to the long-context model",
+    "data": "Data analysis — routed to the long-context model",
+    "reasoning": "Analytical question — routed to the reasoning model",
+    "creative": "Writing task — routed to the creative model",
+    "fast": "Quick question — routed to the fastest model",
+    "default": "General request — routed to the balanced default",
+    "pinned": "Model chosen by you",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Route:
+    model: str
+    intent: str
+
+    @property
+    def reason(self) -> str:
+        return INTENT_LABELS.get(self.intent, INTENT_LABELS["default"])
 
 
 def _compile(patterns: list[str]) -> re.Pattern[str]:
@@ -65,7 +88,7 @@ class ModelRouter:
         r"\b(math|algebra|calculus|geometry|trigonometry|statistics|probability)\b",
         r"\b(logic|theorem|axiom|lemma|proof|contradiction|fallacy)\b",
         # Analysis & strategy
-        r"\b(analyze|critique|compare|contrast|pros and cons|trade-off)\b",
+        r"\b(analyze|analyse|critique|compare|contrast|pros and cons|trade-off)\b",
         r"\b(strategy|plan|roadmap|methodology|framework|approach)\b",
         r"\b(why|how does|explain|implication|consequence|causality)\b",
         r"\b(troubleshoot|diagnose|root cause|investigate)\b",
@@ -92,7 +115,7 @@ class ModelRouter:
 
     DATA_PATTERNS = [
         # Data actions
-        r"\b(summarize|summary|extract|key points|tl;dr|abstract)\b",
+        r"\b(summarize|summarise|summary|extract|key points|tl;dr|abstract)\b",
         r"\b(visualize|plot|chart|graph|dashboard|heatmap)\b",
         r"\b(clean|transform|process|parse|scrape|crawl)\b",
         # Formats & tools
@@ -113,15 +136,15 @@ class ModelRouter:
         return sum(1 for _ in pattern.finditer(text))
 
     @classmethod
-    def determine_model(cls, prompt: str, user_preference: str | None = None) -> str:
-        """Return the model id to use.
+    def route(cls, prompt: str, user_preference: str | None = None) -> Route:
+        """Pick a model and say why.
 
         An explicit ``user_preference`` other than "auto" is validated against the
         registry and returned; unknown ids raise ``UnknownModelError`` rather than
         being forwarded to a provider.
         """
         if user_preference and user_preference.lower() != AUTO:
-            return get_spec(user_preference).id
+            return Route(model=get_spec(user_preference).id, intent="pinned")
 
         prompt = prompt or ""
         coding = cls._score(prompt, cls._CODING)
@@ -131,18 +154,26 @@ class ModelRouter:
 
         # Coding intent wins ties: a mislabelled coding prompt is the costliest miss.
         if coding > 0 and coding >= max(reasoning, creative, data):
-            return DEFAULT_CODING_MODEL
+            return Route(DEFAULT_CODING_MODEL, "coding")
 
-        if (data > 0 and data >= max(reasoning, creative)) or len(prompt) > LONG_PROMPT_CHARS:
-            return DEFAULT_LONG_CONTEXT_MODEL
+        if len(prompt) > LONG_PROMPT_CHARS:
+            return Route(DEFAULT_LONG_CONTEXT_MODEL, "long_context")
+
+        if data > 0 and data >= max(reasoning, creative):
+            return Route(DEFAULT_LONG_CONTEXT_MODEL, "data")
 
         if reasoning > 0 and reasoning >= max(creative, data):
-            return DEFAULT_REASONING_MODEL
+            return Route(DEFAULT_REASONING_MODEL, "reasoning")
 
         if creative > 0:
-            return DEFAULT_LONG_CONTEXT_MODEL
+            return Route(DEFAULT_CREATIVE_MODEL, "creative")
 
         if len(prompt) < SHORT_PROMPT_CHARS:
-            return DEFAULT_FAST_MODEL
+            return Route(DEFAULT_FAST_MODEL, "fast")
 
-        return DEFAULT_MODEL
+        return Route(DEFAULT_MODEL, "default")
+
+    @classmethod
+    def determine_model(cls, prompt: str, user_preference: str | None = None) -> str:
+        """Return the model id to use (see :meth:`route`)."""
+        return cls.route(prompt, user_preference).model

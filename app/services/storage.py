@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 class StorageNotConfiguredError(RuntimeError):
     def __init__(self) -> None:
-        super().__init__("Object storage is not configured. Set the STORAGE_* environment variables.")
+        super().__init__(
+            "Object storage is not configured. Set the STORAGE_* environment variables."
+        )
 
 
 class StorageError(RuntimeError):

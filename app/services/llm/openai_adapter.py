@@ -1,20 +1,32 @@
-"""OpenAI chat-completions adapter."""
+"""OpenAI adapter, built on the Responses API.
+
+The Responses API is the only endpoint every current model supports (the Pro
+tier rejects Chat Completions), and it is where reasoning effort, tools and
+future features land first.
+"""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import openai
 
 from app.core.config import settings
 from app.services.llm.base import (
-    DEFAULT_MAX_OUTPUT_TOKENS,
+    GenerationOptions,
     LLMProvider,
     PromptType,
     ProviderNotConfiguredError,
+    split_system,
 )
-from app.services.llm.schema import ChatMessage
-from app.services.llm.usage import Usage
+from app.services.llm.usage import Outcome, Usage
+
+logger = logging.getLogger(__name__)
+
+# The Pro models only accept medium and above.
+_PRO_MIN_EFFORT = {"low": "medium", "medium": "medium", "high": "high"}
 
 
 class OpenAIAdapter(LLMProvider):
@@ -29,52 +41,78 @@ class OpenAIAdapter(LLMProvider):
             OpenAIAdapter._client = openai.AsyncOpenAI(
                 api_key=settings.OPENAI_API_KEY,
                 max_retries=2,
-                timeout=120.0,
+                timeout=180.0,
             )
         return OpenAIAdapter._client
 
-    @staticmethod
-    def _to_messages(prompt: PromptType) -> list[dict]:
-        if isinstance(prompt, str):
-            return [{"role": "user", "content": prompt}]
+    def _request(
+        self, prompt: PromptType, model: str, options: GenerationOptions | None
+    ) -> dict[str, Any]:
+        spec = self.spec(model)  # rejects unknown models before any network call
+        options = options or GenerationOptions()
+        system_prompt, messages = split_system(prompt, options)
 
-        messages: list[dict] = []
-        for item in prompt:
-            if isinstance(item, ChatMessage):
-                messages.append(item.to_openai_format())
-            elif isinstance(item, dict):
-                role = "assistant" if item.get("role") == "ai" else item.get("role", "user")
-                messages.append({"role": role, "content": item.get("content", "")})
-        return messages
+        kwargs: dict[str, Any] = {
+            "model": spec.api_model,
+            "input": [message.to_responses_input() for message in messages],
+            "max_output_tokens": options.max_output_tokens,
+            # Conversations are stored in our own database; nothing needs to
+            # persist on the provider side.
+            "store": False,
+        }
+        if system_prompt:
+            kwargs["instructions"] = system_prompt
+        if spec.reasoning:
+            effort = options.effort
+            if spec.api_model.endswith("-pro"):
+                effort = _PRO_MIN_EFFORT[effort]
+            kwargs["reasoning"] = {"effort": effort}
+        return kwargs
 
     async def generate_stream(
-        self, prompt: PromptType, model: str, usage: Usage
+        self,
+        prompt: PromptType,
+        model: str,
+        usage: Usage,
+        options: GenerationOptions | None = None,
+        outcome: Outcome | None = None,
     ) -> AsyncGenerator[str, None]:
-        spec = self.spec(model)  # rejects unknown models before any network call
-
-        stream = await self.client.chat.completions.create(
-            model=spec.api_model,
-            messages=self._to_messages(prompt),
-            max_completion_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-            stream=True,
-            stream_options={"include_usage": True},
+        stream = await self.client.responses.create(
+            **self._request(prompt, model, options), stream=True
         )
 
-        async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-            if chunk.usage:
-                usage.record(chunk.usage.prompt_tokens, chunk.usage.completion_tokens)
+        async for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                yield event.delta
+            elif event_type == "response.completed":
+                response = event.response
+                if response.usage:
+                    usage.record(response.usage.input_tokens, response.usage.output_tokens)
+                if outcome is not None:
+                    outcome.served_model = response.model
+                    if getattr(response, "incomplete_details", None):
+                        outcome.finish_reason = "length"
+            elif event_type == "response.incomplete":
+                if outcome is not None:
+                    outcome.finish_reason = "length"
+                response = event.response
+                if response.usage:
+                    usage.record(response.usage.input_tokens, response.usage.output_tokens)
+            elif event_type in ("response.failed", "error"):
+                message = getattr(getattr(event, "response", None), "error", None) or getattr(
+                    event, "message", "OpenAI request failed"
+                )
+                raise RuntimeError(str(message))
 
-    async def generate_text(self, prompt: PromptType, model: str, usage: Usage) -> str:
-        spec = self.spec(model)
-
-        response = await self.client.chat.completions.create(
-            model=spec.api_model,
-            messages=self._to_messages(prompt),
-            max_completion_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-        )
-
+    async def generate_text(
+        self,
+        prompt: PromptType,
+        model: str,
+        usage: Usage,
+        options: GenerationOptions | None = None,
+    ) -> str:
+        response = await self.client.responses.create(**self._request(prompt, model, options))
         if response.usage:
-            usage.record(response.usage.prompt_tokens, response.usage.completion_tokens)
-        return response.choices[0].message.content or ""
+            usage.record(response.usage.input_tokens, response.usage.output_tokens)
+        return response.output_text or ""

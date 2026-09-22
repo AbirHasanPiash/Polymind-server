@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 _TEST_ENV = {
-    "PROJECT_NAME": "AI Platform Test",
+    "PROJECT_NAME": "Polymind Test",
     "API_V1_STR": "/api/v1",
     "ENVIRONMENT": "development",
     "SECRET_KEY": "test-secret-key-that-is-definitely-long-enough-32",
